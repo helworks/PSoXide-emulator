@@ -442,19 +442,11 @@ fn parse_entry(path: &Path, kind: GameKind, size: u64, mtime: u64) -> LibraryEnt
 
     match kind {
         GameKind::DiscBin => parse_bin(path, size, mtime, &fallback_title),
+        // The sector reader takes cooked and raw images alike, so an ISO
+        // shares the BIN probes.
         GameKind::DiscIso => LibraryEntry {
-            id: SectorReader::open(path)
-                .and_then(|reader| disc_identity_id(&reader))
-                .unwrap_or_else(|| raw_image_id(path, size, &fallback_title)),
-            path: path.to_path_buf(),
             kind,
-            title: fallback_title,
-            region: Region::Unknown,
-            size,
-            mtime,
-            // ISO parsing shares the PVD path with BIN once we
-            // handle 2048-byte sectors -- just not today.
-            diagnostic: Some("ISO sector-size parsing not yet implemented".into()),
+            ..parse_bin(path, size, mtime, &fallback_title)
         },
         GameKind::DiscCue => parse_cue(path, size, mtime, &fallback_title),
         GameKind::DiscCcd => parse_ccd(path, size, mtime, &fallback_title),
@@ -1019,6 +1011,20 @@ struct CueTrackSpec {
     file_pregap: u32,
     /// File-relative sector where this track's physical data begins.
     file_start_sector: u32,
+    /// `Some` when the track file holds cooked 2048-byte sectors
+    /// (`MODE1/2048`, `MODE2/2048`), which are rebuilt as raw ones.
+    cooked: Option<crate::disc_image::CookedMode>,
+}
+
+/// The cooked sector mode a CUE track type names, if it names one.
+fn cue_cooked_mode(track_type: &str) -> Option<crate::disc_image::CookedMode> {
+    if track_type.eq_ignore_ascii_case("MODE1/2048") {
+        Some(crate::disc_image::CookedMode::Mode1)
+    } else if track_type.eq_ignore_ascii_case("MODE2/2048") {
+        Some(crate::disc_image::CookedMode::Mode2Form1)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1225,6 +1231,7 @@ fn parse_cue_tracks_str(contents: &str, dir: &Path) -> Result<Vec<CueTrackSpec>,
     let mut current_file: Option<PathBuf> = None;
     let mut current_track_num: Option<u8> = None;
     let mut current_track_type = psx_iso::TrackType::Data;
+    let mut current_cooked = None;
     let mut current_index0: Option<u32> = None;
     let mut cue_pregap = 0u32;
 
@@ -1245,6 +1252,7 @@ fn parse_cue_tracks_str(contents: &str, dir: &Path) -> Result<Vec<CueTrackSpec>,
                 } else {
                     psx_iso::TrackType::Data
                 };
+                current_cooked = cue_cooked_mode(parts[2]);
                 current_index0 = None;
                 cue_pregap = 0;
             }
@@ -1284,6 +1292,7 @@ fn parse_cue_tracks_str(contents: &str, dir: &Path) -> Result<Vec<CueTrackSpec>,
                 pregap: cue_pregap.saturating_add(file_pregap),
                 file_pregap,
                 file_start_sector,
+                cooked: current_cooked,
             });
             current_index0 = None;
             cue_pregap = 0;
@@ -1307,12 +1316,26 @@ pub fn load_disc_from_cue(cue_path: &Path) -> Result<psx_iso::Disc, String> {
     disc_from_cue_specs(&specs, &mut crate::disc_image::open_image)
 }
 
-/// Mount a raw single-file image (`.bin` / `.iso`, or an ECM-packed one)
-/// read from disk on demand. An image shorter than one sector mounts as an
+/// Mount a single-file image (`.bin` / `.iso`, or an ECM-packed one) read
+/// from disk on demand. An image shorter than one sector mounts as an
 /// empty disc, as it did when images were read whole; callers that need a
 /// sector check the length.
+///
+/// An image that does not start with a sync pattern and is a whole number
+/// of 2048-byte sectors is a cooked ISO, and is rebuilt as Mode 2 Form 1
+/// sectors, the form every PS1 data track uses.
 pub fn load_disc_from_bin(path: &Path) -> Result<psx_iso::Disc, String> {
-    let image = crate::disc_image::open_image(path)?;
+    let mut image = crate::disc_image::open_image(path)?;
+    let cooked_len = image.len();
+    if cooked_len != 0
+        && cooked_len.is_multiple_of(crate::disc_image::COOKED_SECTOR_BYTES)
+        && !crate::disc_image::starts_with_sync(image.as_ref())
+    {
+        image = std::sync::Arc::new(crate::disc_image::CookedImage::new(
+            image,
+            crate::disc_image::CookedMode::Mode2Form1,
+        ));
+    }
     let len = image.len();
     Ok(psx_iso::Disc::from_source(Box::new(
         crate::disc_image::ImageSlice::new(image, 0, len),
@@ -1350,19 +1373,36 @@ pub fn disc_from_cue_pieces(
     let mut tracks = Vec::with_capacity(specs.len());
     for spec in &specs {
         let track_bytes = piece(spec.number)?;
-        if !track_bytes.len().is_multiple_of(psx_iso::SECTOR_BYTES) || track_bytes.is_empty() {
+        let sector_bytes = if spec.cooked.is_some() {
+            psx_iso::SECTOR_USER_DATA_BYTES
+        } else {
+            psx_iso::SECTOR_BYTES
+        };
+        if !track_bytes.len().is_multiple_of(sector_bytes) || track_bytes.is_empty() {
             return Err(format!(
-                "track {}: piece is not a whole number of raw sectors",
+                "track {}: piece is not a whole number of {sector_bytes}-byte sectors",
                 spec.number
             ));
         }
+        // A cooked piece is rebuilt as raw sectors; a raw one stays a plain
+        // buffer so CD-DA payloads can still be patched into it.
+        let source: Box<dyn psx_iso::TrackSource> = match spec.cooked {
+            Some(mode) => Box::new(crate::disc_image::CookedImage::new(
+                std::sync::Arc::new(track_bytes),
+                mode,
+            )),
+            None => Box::new(track_bytes),
+        };
         let mut file_pregap = spec.file_pregap;
         let mut pregap = spec.pregap;
         if spec.number == 1 && file_pregap == 0 {
-            file_pregap = detect_track1_embedded_pregap(&track_bytes);
+            let mut first = [0u8; psx_iso::SECTOR_BYTES];
+            if source.read_at(0, &mut first) {
+                file_pregap = detect_track1_embedded_pregap(&first);
+            }
             pregap = pregap.max(file_pregap);
         }
-        let track_file_sectors = track_bytes.len() / psx_iso::SECTOR_BYTES;
+        let track_file_sectors = (source.len() / psx_iso::SECTOR_BYTES as u64) as usize;
         if file_pregap as usize >= track_file_sectors {
             return Err(format!("track {} has no INDEX 01 sectors", spec.number));
         }
@@ -1382,7 +1422,7 @@ pub fn disc_from_cue_pieces(
             sector_count,
             pregap,
             file_pregap,
-            source: Box::new(track_bytes),
+            source,
         });
     }
     Ok(psx_iso::Disc::from_tracks(tracks))
@@ -1395,14 +1435,23 @@ fn disc_from_cue_specs(
     specs: &[CueTrackSpec],
     open: &mut dyn FnMut(&Path) -> Result<crate::disc_image::SharedImage, String>,
 ) -> Result<psx_iso::Disc, String> {
-    let mut images: HashMap<PathBuf, crate::disc_image::SharedImage> = HashMap::new();
+    let mut files: HashMap<PathBuf, crate::disc_image::SharedImage> = HashMap::new();
+    let mut images: HashMap<
+        (PathBuf, Option<crate::disc_image::CookedMode>),
+        crate::disc_image::SharedImage,
+    > = HashMap::new();
     let mut tracks = Vec::with_capacity(specs.len());
 
     for (index, spec) in specs.iter().enumerate() {
-        if !images.contains_key(&spec.path) {
-            images.insert(spec.path.clone(), open(&spec.path)?);
+        let key = (spec.path.clone(), spec.cooked);
+        if !images.contains_key(&key) {
+            if !files.contains_key(&spec.path) {
+                files.insert(spec.path.clone(), open(&spec.path)?);
+            }
+            let file = files.get(&spec.path).expect("opened cue file").clone();
+            images.insert(key.clone(), cue_track_image(&spec.path, file, spec.cooked)?);
         }
-        let image = images.get(&spec.path).expect("opened cue file");
+        let image = images.get(&key).expect("opened cue file");
         let len = image.len();
         if !len.is_multiple_of(psx_iso::SECTOR_BYTES as u64) {
             return Err(format!(
@@ -1487,6 +1536,29 @@ fn disc_from_cue_specs(
     }
 
     Ok(psx_iso::Disc::from_tracks(tracks))
+}
+
+/// A CUE track file as raw sectors: a cooked one is rebuilt on read.
+fn cue_track_image(
+    path: &Path,
+    file: crate::disc_image::SharedImage,
+    cooked: Option<crate::disc_image::CookedMode>,
+) -> Result<crate::disc_image::SharedImage, String> {
+    let Some(mode) = cooked else {
+        return Ok(file);
+    };
+    if !file
+        .len()
+        .is_multiple_of(crate::disc_image::COOKED_SECTOR_BYTES)
+    {
+        return Err(format!(
+            "{} is not a whole number of cooked 2048-byte sectors",
+            path.display()
+        ));
+    }
+    Ok(std::sync::Arc::new(crate::disc_image::CookedImage::new(
+        file, mode,
+    )))
 }
 
 /// Load a full disc model from a CloneCD `.ccd` sheet and sibling
@@ -2430,6 +2502,114 @@ mod tests {
                 "track {n}"
             );
         }
+    }
+
+    /// A small ISO with a boot area and one file, cooked and raw.
+    fn cooked_and_raw_iso() -> (Vec<u8>, Vec<u8>) {
+        let mut builder = psx_iso::IsoBuilder::new().volume_id("COOKED");
+        builder.add_file("SYSTEM.CNF", psx_iso::default_system_cnf());
+        builder.add_file("DATA.BIN", (0..5000u32).map(|i| (i * 13) as u8).collect());
+        (builder.build(), builder.build_bin())
+    }
+
+    fn all_raw_sectors(disc: &psx_iso::Disc) -> Vec<u8> {
+        (0..disc.sector_count() as u32)
+            .flat_map(|lba| disc.read_sector_raw(lba).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn load_disc_from_cue_rebuilds_mode2_2048_tracks_as_raw_form1_sectors() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("cooked.cue");
+        let (cooked, raw) = cooked_and_raw_iso();
+        std::fs::write(tmp.path().join("cooked.bin"), &cooked).unwrap();
+        std::fs::write(
+            &cue_path,
+            "FILE \"cooked.bin\" BINARY\n  TRACK 01 MODE2/2048\n    INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+
+        let disc = load_disc_from_cue(&cue_path).unwrap();
+        assert_eq!(disc.track_count(), 1);
+        let track = disc.track(1).unwrap();
+        assert_eq!(track.start_lba, 0);
+        assert_eq!(track.pregap, 0);
+        assert_eq!(
+            track.sector_count as usize,
+            cooked.len() / psx_iso::SECTOR_USER_DATA_BYTES
+        );
+        assert_eq!(all_raw_sectors(&disc), raw);
+        assert_eq!(
+            disc.read_sector_user(16).unwrap()[..],
+            cooked[16 * 2048..17 * 2048]
+        );
+    }
+
+    #[test]
+    fn load_disc_from_cue_rebuilds_mode1_2048_tracks_with_mode1_headers() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("cooked.cue");
+        let (cooked, _) = cooked_and_raw_iso();
+        std::fs::write(tmp.path().join("cooked.bin"), &cooked).unwrap();
+        std::fs::write(
+            &cue_path,
+            "FILE \"cooked.bin\" BINARY\n  TRACK 01 mode1/2048\n    INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+
+        let disc = load_disc_from_cue(&cue_path).unwrap();
+        let sector = disc.read_sector_raw(16).unwrap();
+        assert_eq!(sector[12..16], [0x00, 0x02, 0x16, 0x01]);
+        assert_eq!(sector[16..16 + 2048], cooked[16 * 2048..17 * 2048]);
+        assert_eq!(
+            disc.read_sector_user(16).unwrap()[..],
+            cooked[16 * 2048..17 * 2048]
+        );
+    }
+
+    #[test]
+    fn load_disc_from_cue_rejects_a_partial_cooked_sector() {
+        let tmp = TempDir::new().unwrap();
+        let cue_path = tmp.path().join("cooked.cue");
+        std::fs::write(tmp.path().join("cooked.bin"), vec![0u8; 2048 * 3 + 1]).unwrap();
+        std::fs::write(
+            &cue_path,
+            "FILE \"cooked.bin\" BINARY\n  TRACK 01 MODE2/2048\n    INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+
+        let Err(err) = load_disc_from_cue(&cue_path) else {
+            panic!("a partial cooked sector loaded");
+        };
+        assert!(err.contains("2048-byte"), "{err}");
+    }
+
+    #[test]
+    fn disc_from_cue_pieces_rebuilds_a_cooked_piece() {
+        let (cooked, raw) = cooked_and_raw_iso();
+        let cue = "FILE \"cooked.bin\" BINARY\n  TRACK 01 MODE2/2048\n    INDEX 01 00:00:00\n";
+        let disc = disc_from_cue_pieces(cue, |_| Ok(cooked.clone())).unwrap();
+        assert_eq!(all_raw_sectors(&disc), raw);
+    }
+
+    #[test]
+    fn load_disc_from_bin_rebuilds_a_cooked_iso_and_keeps_raw_images_raw() {
+        let tmp = TempDir::new().unwrap();
+        let (cooked, raw) = cooked_and_raw_iso();
+        let iso_path = tmp.path().join("game.iso");
+        let bin_path = tmp.path().join("game.bin");
+        std::fs::write(&iso_path, &cooked).unwrap();
+        std::fs::write(&bin_path, &raw).unwrap();
+
+        assert_eq!(
+            all_raw_sectors(&load_disc_from_bin(&iso_path).unwrap()),
+            raw
+        );
+        assert_eq!(
+            all_raw_sectors(&load_disc_from_bin(&bin_path).unwrap()),
+            raw
+        );
     }
 
     // The web build's path: same sheet, same image, no filesystem. Must slice
