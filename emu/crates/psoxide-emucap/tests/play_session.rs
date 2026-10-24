@@ -108,7 +108,7 @@ fn record_session(path: &Path, exe: Vec<u8>) -> Recorded {
             .any(|sample| sample.buttons == CROSS),
         "the guest never read the held Cross"
     );
-    session.save(&machine).expect("save session");
+    assert!(session.save(&machine).expect("save session"));
     Recorded {
         input_hash: ram_u32(&machine, INPUT_HASH),
         polls: ram_u32(&machine, COUNTER),
@@ -131,11 +131,14 @@ fn run_until_result(machine: &mut Machine, session: &mut PlaySession, limit: u64
 fn recorded_session_replays_to_same_state() {
     let dir = ScratchDir::new("same-state");
     let recorded = record_session(&dir.tape(), drawing_guest_exe());
+    let source = read_tape_full(&dir.tape()).unwrap();
 
     let mut machine = boot(drawing_guest_exe());
     let mut session = PlaySession::begin(&mut machine, dir.tape());
     assert!(session.replaying());
     let result = run_until_result(&mut machine, &mut session, 2 * SESSION_FRAMES);
+    // The replay re-recorded exactly what it played.
+    assert_eq!(machine.recorded_samples(), &source.samples[..]);
 
     assert_eq!(result.report, ReplayReport::SameState);
     assert!(!result.image_changed);
@@ -182,7 +185,7 @@ fn missing_tape_reports_no_tape_and_records() {
         run_frame(&mut machine);
         assert_eq!(session.after_frame(&mut machine), None);
     }
-    session.save(&machine).unwrap();
+    assert!(session.save(&machine).unwrap());
 
     let bytes = std::fs::read(dir.tape()).unwrap();
     assert_eq!(&bytes[..8], b"PXITAPE3");
@@ -219,7 +222,7 @@ fn corrupt_tape_reports_unreadable_and_starts_fresh() {
         machine.recorded_samples().len() as u64,
         machine.guest_pad_polls()
     );
-    session.save(&machine).unwrap();
+    assert!(session.save(&machine).unwrap());
     assert_eq!(read_tape_full(&dir.tape()).unwrap().end.unwrap().frame, 30);
 }
 
@@ -278,7 +281,7 @@ fn save_is_atomic() {
         run_frame(&mut machine);
         session.after_frame(&mut machine);
     }
-    session.save(&machine).unwrap();
+    assert!(session.save(&machine).unwrap());
     assert_eq!(session.frames_since_save(), 0);
     for _ in 0..10 {
         run_frame(&mut machine);
@@ -286,7 +289,7 @@ fn save_is_atomic() {
     }
     assert_eq!(session.frames_since_save(), 10);
     // A second save replaces the first in place.
-    session.save(&machine).unwrap();
+    assert!(session.save(&machine).unwrap());
 
     let mut tmp = dir.tape().into_os_string();
     tmp.push(".tmp");
@@ -295,6 +298,69 @@ fn save_is_atomic() {
     assert_eq!(tape.end.unwrap().frame, 20);
     let entries = std::fs::read_dir(&dir.0).unwrap().count();
     assert_eq!(entries, 1, "only the tape itself remains");
+}
+
+#[test]
+fn save_during_replay_keeps_the_previous_tape() {
+    let dir = ScratchDir::new("replay-save");
+    record_session(&dir.tape(), drawing_guest_exe());
+    let before = std::fs::read(dir.tape()).unwrap();
+
+    let mut machine = boot(drawing_guest_exe());
+    let mut session = PlaySession::begin(&mut machine, dir.tape());
+    for _ in 0..SESSION_FRAMES / 2 {
+        run_frame(&mut machine);
+        assert_eq!(session.after_frame(&mut machine), None);
+    }
+    assert!(session.replaying());
+    assert!(!session.can_save());
+    // The flush and the shutdown save both go through `save`: mid-replay it
+    // must leave the previous session's tape untouched.
+    assert!(!session.save(&machine).unwrap());
+    assert_eq!(std::fs::read(dir.tape()).unwrap(), before);
+
+    run_until_result(&mut machine, &mut session, 2 * SESSION_FRAMES);
+    for _ in 0..5 {
+        run_frame(&mut machine);
+        session.after_frame(&mut machine);
+    }
+    assert!(session.can_save());
+    assert!(session.save(&machine).unwrap());
+    let after = read_tape_full(&dir.tape()).unwrap();
+    assert_eq!(after.end.unwrap().frame, SESSION_FRAMES + 5);
+}
+
+#[test]
+fn unreadable_path_is_never_overwritten() {
+    let dir = ScratchDir::new("io-error");
+    // A directory where the tape should be: reading it fails with an I/O
+    // error other than not-found, so it might be a tape the session cannot
+    // see right now (locked, permissions) and must not be replaced.
+    std::fs::create_dir_all(dir.tape()).unwrap();
+    std::fs::write(dir.tape().join("marker"), b"keep").unwrap();
+    let mut machine = boot(drawing_guest_exe());
+    let mut session = PlaySession::begin(&mut machine, dir.tape());
+    assert!(!session.replaying());
+
+    run_frame(&mut machine);
+    let first = session
+        .after_frame(&mut machine)
+        .expect("an immediate result");
+    match &first.report {
+        ReplayReport::TapeUnreadable(message) => assert!(message.starts_with("io:"), "{message}"),
+        other => panic!("expected an unreadable tape, got {other:?}"),
+    }
+    for _ in 1..30 {
+        run_frame(&mut machine);
+        session.after_frame(&mut machine);
+    }
+    assert!(!session.can_save());
+    assert!(!session.save(&machine).unwrap());
+    assert!(dir.tape().is_dir());
+    assert_eq!(std::fs::read(dir.tape().join("marker")).unwrap(), b"keep");
+    let mut tmp = dir.tape().into_os_string();
+    tmp.push(".tmp");
+    assert!(!Path::new(&tmp).exists());
 }
 
 #[test]
@@ -346,7 +412,7 @@ fn input_change_inside_a_poll_records_what_the_guest_read() {
         machine.recorded_samples().len() as u64,
         machine.guest_pad_polls()
     );
-    session.save(&machine).unwrap();
+    assert!(session.save(&machine).unwrap());
     let recorded_hash = ram_u32(&machine, INPUT_HASH);
 
     let mut replay = boot(drawing_guest_exe());

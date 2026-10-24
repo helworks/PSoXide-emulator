@@ -28,8 +28,11 @@ use crate::machine::{Boundary, Machine};
 pub enum ReplayReport {
     /// No tape at the session path: nothing to replay, recording from boot.
     NoTape,
-    /// A file at the session path that is not a Play-session tape; the session
-    /// records from boot and the next save replaces it.
+    /// The session path holds no usable tape and the session records from
+    /// boot. A file that is not a Play-session tape (bad format) is replaced
+    /// by the next save. A file that could not be read at all (an I/O error
+    /// other than not-found; the message starts with `io:`) may still be a
+    /// good tape, so that session never saves over it.
     TapeUnreadable(String),
     /// The display at the end frame is the recorded one.
     SameState,
@@ -100,6 +103,9 @@ pub struct PlaySession {
     frame: u64,
     /// The machine frame of the last save (or of `begin`).
     saved_frame: Cell<u64>,
+    /// Why this session must never write its tape (the tape could not be
+    /// read, so it may hold a recording the session must not destroy).
+    save_refused: Option<String>,
 }
 
 impl PlaySession {
@@ -115,6 +121,7 @@ impl PlaySession {
             immediate: None,
             frame: machine.frame(),
             saved_frame: Cell::new(machine.frame()),
+            save_refused: None,
         };
         let bytes = match std::fs::read(&session.path) {
             Ok(bytes) => bytes,
@@ -126,7 +133,9 @@ impl PlaySession {
                 return session;
             }
             Err(error) => {
-                session.unreadable(format!("read {}: {error}", session.path.display()));
+                let message = format!("io: read {}: {error}", session.path.display());
+                session.save_refused = Some(message.clone());
+                session.unreadable(message);
                 return session;
             }
         };
@@ -214,11 +223,27 @@ impl PlaySession {
         self.path.display().to_string()
     }
 
+    /// Whether [`PlaySession::save`] would write now: not while replaying
+    /// (the previous tape stays authoritative until the hand-over at its end
+    /// frame), and never in a session whose tape could not be read.
+    pub fn can_save(&self) -> bool {
+        !self.replaying() && self.save_refused.is_none()
+    }
+
     /// Write the session so far as the session's tape: every recorded sample
     /// from poll 0, the current frame and display hash as its end, and the
     /// booted image's hash. Written to `<path>.tmp` and renamed over the tape,
     /// so an interrupted save leaves the previous tape intact.
-    pub fn save(&self, machine: &Machine) -> Result<(), String> {
+    ///
+    /// Returns `Ok(false)` without touching the file when
+    /// [`PlaySession::can_save`] is false: a save during a replay would cut
+    /// the previous session's tail off before it was replayed, and a tape
+    /// that could not be read may still be a good one. `Ok(true)` means the
+    /// tape was written.
+    pub fn save(&self, machine: &Machine) -> Result<bool, String> {
+        if !self.can_save() {
+            return Ok(false);
+        }
         let end = TapeEnd {
             frame: machine.frame(),
             display_hash: machine.display_hash().0,
@@ -248,7 +273,7 @@ impl PlaySession {
             )
         })?;
         self.saved_frame.set(machine.frame());
-        Ok(())
+        Ok(true)
     }
 
     /// Frames since the last save (or `begin`), as of the last `after_frame`;

@@ -94,7 +94,7 @@ pub struct HostArgs {
     pub input_tape_delay_ticks: u64,
     /// Play-session tape: replay it from boot to its recorded end (emitting a
     /// `play_replay_result` event), record the whole session, and save it back
-    /// here every 600 frames and on shutdown.
+    /// here every 600 frames and on shutdown, once the replay has handed over.
     #[arg(long, conflicts_with = "input_tape")]
     pub tape: Option<PathBuf>,
 }
@@ -193,6 +193,7 @@ fn serve(args: HostArgs) -> Result<(), String> {
         if let Some(result) = session.after_frame(host.machine_mut()) {
             host.machine_mut().push_event(result.event());
         }
+        // `save` skips itself while replaying or when the tape was unreadable.
         if session.frames_since_save() >= PLAY_SAVE_FRAMES {
             if let Err(error) = session.save(host.machine()) {
                 eprintln!("[emucap] Play session save failed: {error}");
