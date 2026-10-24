@@ -1,0 +1,25 @@
+[package]
+name = "psoxide-emucap"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "emucap producer host for PSoXide: speaks emucap's NDJSON control wire from inside the emulator process and executes every request on the emulator thread between frames. Headless -- no GUI/wgpu deps."
+
+[dependencies]
+emulator-core    = { workspace = true }
+psoxide-settings = { workspace = true }
+psx-hw           = { workspace = true }
+psx-iso          = { workspace = true }
+serde            = { workspace = true, features = ["std"] }
+serde_json       = { workspace = true }
+sha2             = { workspace = true }
+sha1             = "0.10"
+base64           = "0.22"
+image            = { workspace = true }
+clap             = { workspace = true }
+
+[lints]
+workspace = true
