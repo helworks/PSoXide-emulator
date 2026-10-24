@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use emulator_core::button::{CIRCLE, CROSS, START};
-use emulator_core::input_tape::{read_tape_full, tape_poll_bound_bytes};
+use emulator_core::input_tape::{
+    read_tape_full, tape_poll_bound_bytes, tape_to_csv, write_tape, PadSample, TapeClock, TapeEnd,
+};
 use psoxide_emucap::machine::{
     AdvanceControl, BootConfig, Content, Machine, PadProfile, PortInput, Stop, Unit,
 };
@@ -361,6 +363,62 @@ fn unreadable_path_is_never_overwritten() {
     let mut tmp = dir.tape().into_os_string();
     tmp.push(".tmp");
     assert!(!Path::new(&tmp).exists());
+}
+
+#[test]
+fn non_play_tape_is_reported_and_never_overwritten() {
+    let samples = [PadSample::from_buttons(CROSS), PadSample::from_buttons(0)];
+    let end = Some(TapeEnd {
+        frame: 30,
+        display_hash: 1,
+    });
+    let pxitape1 = {
+        let dir = ScratchDir::new("non-play-source");
+        write_tape(&dir.tape(), &samples).unwrap();
+        std::fs::read(dir.tape()).unwrap()
+    };
+    assert_eq!(&pxitape1[..8], b"PXITAPE1");
+    let kinds: [(&str, Vec<u8>); 4] = [
+        ("pxitape1", pxitape1),
+        (
+            "pxitape2",
+            tape_poll_bound_bytes(&samples, 0, None, None).unwrap(),
+        ),
+        (
+            "pxitape3-mid-run",
+            tape_poll_bound_bytes(&samples, 5, end, None).unwrap(),
+        ),
+        (
+            "csv",
+            tape_to_csv(&samples, TapeClock::VideoFrame, 0, None).into_bytes(),
+        ),
+    ];
+    for (kind, bytes) in kinds {
+        let dir = ScratchDir::new(&format!("non-play-{kind}"));
+        std::fs::write(dir.tape(), &bytes).unwrap();
+        let mut machine = boot(drawing_guest_exe());
+        let mut session = PlaySession::begin(&mut machine, dir.tape());
+        assert!(!session.replaying(), "{kind}");
+
+        run_frame(&mut machine);
+        let first = session
+            .after_frame(&mut machine)
+            .expect("an immediate result");
+        match &first.report {
+            ReplayReport::TapeUnreadable(message) => assert!(
+                message.contains("non-Play tape") && message.contains("will not be overwritten"),
+                "{kind}: {message}"
+            ),
+            other => panic!("{kind}: expected an unreadable tape, got {other:?}"),
+        }
+        for _ in 1..30 {
+            run_frame(&mut machine);
+            session.after_frame(&mut machine);
+        }
+        assert!(!session.can_save(), "{kind}");
+        assert!(!session.save(&machine).unwrap(), "{kind}");
+        assert_eq!(std::fs::read(dir.tape()).unwrap(), bytes, "{kind}");
+    }
 }
 
 #[test]

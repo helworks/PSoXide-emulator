@@ -29,10 +29,12 @@ pub enum ReplayReport {
     /// No tape at the session path: nothing to replay, recording from boot.
     NoTape,
     /// The session path holds no usable tape and the session records from
-    /// boot. A file that is not a Play-session tape (bad format) is replaced
-    /// by the next save. A file that could not be read at all (an I/O error
-    /// other than not-found; the message starts with `io:`) may still be a
-    /// good tape, so that session never saves over it.
+    /// boot. Bytes that do not parse as any tape are replaced by the next
+    /// save. A well-formed tape of another kind (`PXITAPE1`/`PXITAPE2`, CSV,
+    /// or a `PXITAPE3` that does not start at poll 0) and a file that could not
+    /// be read at all (an I/O error other than not-found; the message starts
+    /// with `io:`) may hold a recording someone wants, so that session never
+    /// saves over them.
     TapeUnreadable(String),
     /// The display at the end frame is the recorded one.
     SameState,
@@ -104,7 +106,8 @@ pub struct PlaySession {
     /// The machine frame of the last save (or of `begin`).
     saved_frame: Cell<u64>,
     /// Why this session must never write its tape (the tape could not be
-    /// read, so it may hold a recording the session must not destroy).
+    /// read, or is a non-Play tape, so it may hold a recording the session
+    /// must not destroy).
     save_refused: Option<String>,
 }
 
@@ -149,10 +152,14 @@ impl PlaySession {
         let end = match tape.end {
             Some(end) if tape.clock == TapeClock::PadPoll && tape.start_poll == 0 => end,
             _ => {
-                session.unreadable(format!(
-                    "{}: not a Play-session tape (needs a poll-bound tape from boot with an end marker)",
+                // A well-formed tape of another kind is somebody's recording:
+                // never replace it with this session's.
+                let message = format!(
+                    "{}: a non-Play tape (a Play tape is poll-bound from boot with an end marker); it will not be overwritten",
                     session.path.display()
-                ));
+                );
+                session.save_refused = Some(message.clone());
+                session.unreadable(message);
                 return session;
             }
         };
@@ -225,7 +232,8 @@ impl PlaySession {
 
     /// Whether [`PlaySession::save`] would write now: not while replaying
     /// (the previous tape stays authoritative until the hand-over at its end
-    /// frame), and never in a session whose tape could not be read.
+    /// frame), and never in a session whose tape could not be read or is a
+    /// non-Play tape.
     pub fn can_save(&self) -> bool {
         !self.replaying() && self.save_refused.is_none()
     }
