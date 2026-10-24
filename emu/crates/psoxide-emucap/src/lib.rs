@@ -16,6 +16,7 @@
 //! - [`machine`]: the headless `Cpu` + `Bus` and its clocks.
 //! - [`memory`]: side-effect-free memory regions.
 //! - [`host`]: method dispatch (`hello`, `status`, `step`, ...).
+//! - [`play_session`]: record every session to one tape, replay it next time.
 //! - [`transport`]: socket/stdio service and the emulator loop.
 //!
 //! [`run`] wires them together for the `psoxide-emucap-host` binary and the
@@ -25,6 +26,7 @@ pub mod auth;
 pub mod host;
 pub mod machine;
 pub mod memory;
+pub mod play_session;
 pub mod transport;
 pub mod wire;
 
@@ -35,6 +37,7 @@ use clap::{Args, ValueEnum};
 
 use host::{Host, HostIdentity};
 use machine::{BootConfig, Content, Machine, PadProfile};
+use play_session::PlaySession;
 use transport::{serve_jobs, ProducerConfig};
 
 /// Controller profile flag values.
@@ -89,7 +92,15 @@ pub struct HostArgs {
     /// Route ticks to wait before a video-frame tape's first sample.
     #[arg(long, default_value_t = 0)]
     pub input_tape_delay_ticks: u64,
+    /// Play-session tape: replay it from boot to its recorded end (emitting a
+    /// `play_replay_result` event), record the whole session, and save it back
+    /// here every 600 frames and on shutdown.
+    #[arg(long, conflicts_with = "input_tape")]
+    pub tape: Option<PathBuf>,
 }
+
+/// Free-running frames between periodic Play-session saves.
+const PLAY_SAVE_FRAMES: u64 = 600;
 
 /// Stack for the emulator thread. `Bus` is large and debug builds copy it by
 /// value while booting; the 1 MiB Windows main-thread stack is not enough.
@@ -129,6 +140,10 @@ fn serve(args: HostArgs) -> Result<(), String> {
             path.display().to_string(),
         )?;
     }
+    let mut session = args
+        .tape
+        .clone()
+        .map(|path| PlaySession::begin(&mut machine, path));
     let identity = HostIdentity {
         launch_id: env("EMUCAP_LAUNCH_ID"),
         name: env("EMUCAP_NAME"),
@@ -171,7 +186,23 @@ fn serve(args: HostArgs) -> Result<(), String> {
     }
     .map_err(|error| format!("spawn transport thread: {error}"))?;
 
-    serve_jobs(&mut host, &jobs_rx, args.unthrottled);
+    let mut after_frame = |host: &mut Host| {
+        let Some(session) = session.as_mut() else {
+            return;
+        };
+        if let Some(result) = session.after_frame(host.machine_mut()) {
+            host.machine_mut().push_event(result.event());
+        }
+        if session.frames_since_save() >= PLAY_SAVE_FRAMES {
+            if let Err(error) = session.save(host.machine()) {
+                eprintln!("[emucap] Play session save failed: {error}");
+            }
+        }
+    };
+    serve_jobs(&mut host, &jobs_rx, args.unthrottled, &mut after_frame);
     let _ = transport.join();
+    if let Some(session) = session.as_ref() {
+        session.save(host.machine())?;
+    }
     Ok(())
 }

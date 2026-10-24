@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use emulator_core::input_tape::{PadSample, Tape, TapeClock};
+use emulator_core::input_tape::{game_image_hash, GameImageHasher, PadSample, Tape, TapeClock};
 use emulator_core::{fast_boot_disc, Bus, Cpu, EmulatorState, EmulatorStateRef};
 use psoxide_settings::savestate::SaveStateV1;
 use psx_iso::{Disc, Exe};
@@ -262,6 +262,11 @@ pub struct Machine {
     inputs: [PortInput; 2],
     tape: Option<TapePlayback>,
     tape_seen_polls: u64,
+    port1_sample: PadSample,
+    port1_hold_neutral: bool,
+    recording: bool,
+    recorded: Vec<PadSample>,
+    game_hash: u64,
     poll_offset: u64,
     exact_poll_stepping: bool,
     halted: Option<String>,
@@ -281,7 +286,7 @@ pub struct Machine {
 impl Machine {
     /// Boot `config` and stop before the first instruction.
     pub fn boot(config: BootConfig) -> Result<Self, String> {
-        let (cpu, bus) = boot_core(&config)?;
+        let (cpu, bus, game_hash) = boot_core(&config)?;
         let mut machine = Self {
             config,
             cpu,
@@ -293,6 +298,11 @@ impl Machine {
             inputs: [PortInput::default(); 2],
             tape: None,
             tape_seen_polls: 0,
+            port1_sample: PadSample::default(),
+            port1_hold_neutral: false,
+            recording: false,
+            recorded: Vec::new(),
+            game_hash,
             poll_offset: 0,
             exact_poll_stepping: false,
             halted: None,
@@ -385,6 +395,12 @@ impl Machine {
         self.tape.as_ref()
     }
 
+    /// [`game_image_hash`] of the booted image: the EXE file, or every disc
+    /// track's raw bytes in order (the GUI's input-tape image hash).
+    pub fn game_hash(&self) -> u64 {
+        self.game_hash
+    }
+
     /// Whether port 2 has a controller to drive.
     pub fn port2_connected(&self) -> bool {
         self.bus.port2_pad_mode().is_some()
@@ -414,17 +430,34 @@ impl Machine {
     }
 
     /// Write the effective state of `port` to the bus: the tape on port 1 while
-    /// one is playing, otherwise the agent's override (or a neutral pad).
+    /// one is playing, otherwise the agent's override (or a neutral pad), or a
+    /// neutral pad regardless while [`Machine::set_port1_hold_neutral`] holds.
     fn publish_input(&mut self, port: usize) {
         if port == 0 {
             if let Some(sample) = self.tape_sample() {
-                sample.apply_to_bus(&mut self.bus);
-                return;
+                self.apply_port1(sample);
+            } else if self.port1_hold_neutral {
+                self.apply_port1(PortInput::default().sample());
+            } else {
+                self.apply_port1(self.inputs[0].sample());
             }
-            self.inputs[0].sample().apply_to_bus(&mut self.bus);
         } else if self.port2_connected() {
             self.inputs[1].sample().apply_to_bus_port2(&mut self.bus);
         }
+    }
+
+    fn apply_port1(&mut self, sample: PadSample) {
+        self.port1_sample = sample;
+        sample.apply_to_bus(&mut self.bus);
+    }
+
+    /// While `hold` is set, port 1 reads a neutral pad whenever no tape sample
+    /// applies, whatever the agent's override says. A replay holds it so polls
+    /// past the end of a short tape see what a recording would have seen
+    /// without input, not live input. Clearing it re-applies the override.
+    pub fn set_port1_hold_neutral(&mut self, hold: bool) {
+        self.port1_hold_neutral = hold;
+        self.publish_input(0);
     }
 
     fn tape_sample(&self) -> Option<PadSample> {
@@ -513,9 +546,53 @@ impl Machine {
         let index = index as usize;
         if playback.cursor != Some(index) {
             playback.cursor = Some(index);
-            playback.tape.samples[index].apply_to_bus(&mut self.bus);
+            let sample = playback.tape.samples[index];
+            self.apply_port1(sample);
         }
         false
+    }
+
+    // --- recording -----------------------------------------------------------
+
+    /// Start recording port 1 from scratch: from now on every completed
+    /// port-1 poll appends the sample the guest read at it, whether a tape or
+    /// the override supplied it. Call it at boot so entry N is poll N, the
+    /// clock a poll-bound tape with `start_poll` 0 replays on. A `reset` or
+    /// `load_state` restarts the guest's poll clock but not the recording, so
+    /// a recording spanning one no longer lines up with a replay from boot.
+    pub fn start_recording(&mut self) {
+        self.recording = true;
+        self.recorded.clear();
+    }
+
+    /// Samples recorded since [`Machine::start_recording`], one per completed
+    /// port-1 poll; empty when not recording.
+    pub fn recorded_samples(&self) -> &[PadSample] {
+        &self.recorded
+    }
+
+    /// Append what the guest read at the `completed` polls that just finished.
+    /// The button and stick bytes come from the pad's record of the poll
+    /// transaction itself, so an input change that landed between two bytes
+    /// of the poll is recorded as the mix the guest actually received; bytes
+    /// the poll did not carry (the sticks of a digital poll) keep the sample
+    /// published on port 1.
+    fn record_polls(&mut self, completed: u64) {
+        let mut sample = self.port1_sample;
+        if let Some(poll) = self.bus.port1_recent_polls().last() {
+            if poll.complete && poll.len >= 4 {
+                sample.buttons = !(u16::from(poll.rx[2]) | (u16::from(poll.rx[3]) << 8));
+            }
+            if poll.complete && poll.len >= 8 {
+                sample.right_x = poll.rx[4];
+                sample.right_y = poll.rx[5];
+                sample.left_x = poll.rx[6];
+                sample.left_y = poll.rx[7];
+            }
+        }
+        for _ in 0..completed {
+            self.recorded.push(sample);
+        }
     }
 
     // --- execution -----------------------------------------------------------
@@ -758,7 +835,9 @@ impl Machine {
             .as_ref()
             .is_some_and(|tape| tape.tape.clock == TapeClock::PadPoll);
         let seen = self.bus.port1_completed_polls();
-        let watch_polls = watch == Watch::Polls || poll_tape;
+        // Recording stops a batch on every completed poll too, so each poll's
+        // sample is captured before the tape or the agent replaces it.
+        let watch_polls = watch == Watch::Polls || poll_tape || self.recording;
         let display_start = match watch {
             Watch::DisplayStart(start) => Some(start),
             _ => None,
@@ -795,7 +874,11 @@ impl Machine {
             return (ran, false);
         }
         let mut tape_ended = false;
-        if poll_tape && self.bus.port1_completed_polls() != seen {
+        let polls = self.bus.port1_completed_polls();
+        if self.recording && polls > seen {
+            self.record_polls(polls - seen);
+        }
+        if poll_tape && polls != seen {
             tape_ended |= self.sync_tape(false);
         }
         if self.bus.cycles() >= self.tick_deadline || self.tick_steps >= ROUTE_STEPS_PER_FRAME {
@@ -825,7 +908,7 @@ impl Machine {
     /// Reboot the same content from power-on. Persistent overrides survive and
     /// are re-applied; a playing tape is stopped.
     pub fn reset(&mut self) -> Result<(), String> {
-        let (cpu, bus) = boot_core(&self.config)?;
+        let (cpu, bus, _) = boot_core(&self.config)?;
         self.poll_offset += self.bus.port1_completed_polls();
         self.cpu = cpu;
         self.bus = bus;
@@ -950,14 +1033,15 @@ fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, String> {
     })
 }
 
-/// Build a fresh CPU + bus for `config`, the same way `launch --path` does.
-fn boot_core(config: &BootConfig) -> Result<(Cpu, Bus), String> {
+/// Build a fresh CPU + bus for `config`, the same way `launch --path` does,
+/// and the [`game_image_hash`] of what it booted.
+fn boot_core(config: &BootConfig) -> Result<(Cpu, Bus, u64), String> {
     let mut cpu = Cpu::new();
     let mut bus = Bus::new_without_bios();
-    let is_exe = match &config.content {
+    let (is_exe, game_hash) = match &config.content {
         Content::ExeBytes { bytes, .. } => {
             side_load_exe(&mut cpu, &mut bus, bytes)?;
-            true
+            (true, game_image_hash(bytes))
         }
         Content::File(path) => {
             let ext = path
@@ -970,17 +1054,18 @@ fn boot_core(config: &BootConfig) -> Result<(Cpu, Bus), String> {
                     let bytes = std::fs::read(path)
                         .map_err(|error| format!("read {}: {error}", path.display()))?;
                     side_load_exe(&mut cpu, &mut bus, &bytes)?;
-                    true
+                    (true, game_image_hash(&bytes))
                 }
                 "bin" | "iso" | "cue" | "ccd" => {
                     let disc = load_disc(path)?;
+                    let game_hash = disc_image_hash(&disc);
                     fast_boot_disc(&mut bus, &mut cpu, &disc)
                         .map_err(|error| format!("boot {}: {error:?}", path.display()))?;
                     bus.cdrom.insert_disc(Some(disc));
                     if matches!(ext.as_str(), "cue" | "ccd") {
                         apply_libcrypt_sbi(&mut bus, path);
                     }
-                    false
+                    (false, game_hash)
                 }
                 other => return Err(format!("unsupported content extension: .{other}")),
             }
@@ -1006,7 +1091,17 @@ fn boot_core(config: &BootConfig) -> Result<(Cpu, Bus), String> {
         }
         bus.cdrom.insert_disc(Some(load_disc(path)?));
     }
-    Ok((cpu, bus))
+    Ok((cpu, bus, game_hash))
+}
+
+/// The GUI's input-tape image hash for a disc (`app::disc_image_hash`): every
+/// track's raw bytes in order, hashed as one stream, read a megabyte at a time.
+fn disc_image_hash(disc: &Disc) -> u64 {
+    let mut hasher = GameImageHasher::new();
+    for track in disc.tracks() {
+        psoxide_settings::disc_image::for_each_chunk(&*track.source, |bytes| hasher.update(bytes));
+    }
+    hasher.finish()
 }
 
 fn side_load_exe(cpu: &mut Cpu, bus: &mut Bus, bytes: &[u8]) -> Result<(), String> {

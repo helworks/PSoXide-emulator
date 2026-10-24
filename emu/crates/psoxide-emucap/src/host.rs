@@ -149,6 +149,12 @@ impl Host {
         &self.machine
     }
 
+    /// The machine, mutably, for the emulator loop's per-frame work (a Play
+    /// session's replay check and recording).
+    pub fn machine_mut(&mut self) -> &mut Machine {
+        &mut self.machine
+    }
+
     /// Current run state.
     pub fn run_state(&self) -> RunState {
         self.run_state
