@@ -3741,6 +3741,9 @@ impl Bus {
                     panic!("GPU_LL_FIFO_CONTRACT: mode=linked-list node={:#010x} payload_words={}; opt-in packing diagnostic", list.address, list.remaining);
                 }
                 list.next = header & 0x00ff_ffff;
+                // MADR follows the walk: it holds the link of the node last
+                // fetched, so a finished list leaves the terminator there.
+                self.dma.channels[2].base = list.next;
                 list.word = list.address.wrapping_add(4);
                 list.need_header = false;
                 // A node with a payload keeps the reference-model setup
@@ -3808,13 +3811,16 @@ impl Bus {
             // Each node costs its payload word count plus one cycle for
             // the header fetch.
             total_words = total_words.saturating_add(word_count + 1);
+            // MADR follows the walk: it holds the link of the node last
+            // fetched, so a finished list leaves the terminator there.
+            self.dma.channels[2].base = header & 0x00ff_ffff;
             // End-of-chain: hardware uses *any* pointer with bit 23
             // set (0x800000) as the terminator, not just the common
             // 0x00FF_FFFF sentinel (PSX-SPX "DMA Channel 2").
             if (header & 0x800000) != 0 {
                 return gpu_command_linked_cycles(total_words, node_count);
             }
-            addr = header & 0x00ff_ffff;
+            addr = header & 0x001f_fffc;
         }
         gpu_command_linked_cycles(total_words, node_count)
     }
@@ -6772,6 +6778,40 @@ mod tests {
             assert_eq!(bus.dma.channels[2].channel_control & (1 << 24), 0);
             assert_eq!(bus.gpu.vram.get_pixel(0x20, 0x10), 0x1f00);
             assert_eq!(bus.gpu.vram.get_pixel(0x23, 0x10), 0x1fff);
+        }
+    }
+
+    /// A finished list leaves its terminator link in MADR. PSYQo's GPU DMA
+    /// handler reads it back to tell a completed chain (00FFFFFFh) from one
+    /// that stopped early on a link it marked with bit 23; one that read the
+    /// list head instead resent the chain forever and never presented a
+    /// frame.
+    #[test]
+    fn gpu_linked_list_leaves_the_terminator_link_in_madr() {
+        for fifo in [true, false] {
+            let mut bus = gpu_list_bus(fifo, &gp0_data_word_nodes());
+            bus.run_dma_channel(2);
+            clocks_until_dma_done(&mut bus);
+            assert_eq!(bus.dma.channels[2].base, 0x00ff_ffff, "fifo={fifo}");
+        }
+    }
+
+    /// Any link with bit 23 set ends the walk without fetching what it
+    /// points at, and MADR keeps the link's low bits, which PSYQo uses as a
+    /// flag on the node it stopped before.
+    #[test]
+    fn gpu_linked_list_stops_on_a_bit_23_link_and_keeps_it_in_madr() {
+        for fifo in [true, false] {
+            let mut bus = gpu_list_bus(fifo, &[vec![0], vec![0]]);
+            // Re-link the last node to a flagged, never-fetched packet.
+            write_ram_u32(&mut bus.ram[..], 0x1008, (1 << 24) | 0x0080_2001);
+            write_ram_u32(&mut bus.ram[..], 0x2000, (1 << 24) | 0x00ff_ffff);
+            write_ram_u32(&mut bus.ram[..], 0x2004, 0x0200_0000);
+            let writes = bus.gpu.gp0_write_count();
+            bus.run_dma_channel(2);
+            clocks_until_dma_done(&mut bus);
+            assert_eq!(bus.dma.channels[2].base, 0x0080_2001, "fifo={fifo}");
+            assert_eq!(bus.gpu.gp0_write_count() - writes, 2, "fifo={fifo}");
         }
     }
 
