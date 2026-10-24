@@ -200,6 +200,12 @@ pub enum Command {
     /// for a few seconds, without opening a window. Press buttons while it
     /// runs to see exactly what the emulator receives.
     InputProbe(InputProbeArgs),
+
+    /// Run headlessly as an emucap producer: boot a game and serve emucap's
+    /// control wire (frame/instruction/poll stepping, memory, input, save
+    /// states) to its Control MCP, or on stdin/stdout with `--stdio`.
+    #[cfg(feature = "emucap")]
+    EmucapHost(psoxide_emucap::HostArgs),
 }
 
 /// Arguments for `input-probe`.
@@ -777,6 +783,8 @@ pub fn run(cli: Cli) -> Result<(), String> {
 
         Command::UiPng(args) => ui_png::render(args),
         Command::InputProbe(args) => crate::input::probe::run(args.seconds),
+        #[cfg(feature = "emucap")]
+        Command::EmucapHost(args) => psoxide_emucap::run(args),
     }
 }
 

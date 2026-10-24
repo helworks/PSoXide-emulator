@@ -3139,6 +3139,7 @@ dependencies = [
  "objc2-game-controller",
  "pollster 0.3.0",
  "psoxide-debug-ui",
+ "psoxide-emucap",
  "psoxide-jit",
  "psoxide-settings",
  "psoxide-validation",

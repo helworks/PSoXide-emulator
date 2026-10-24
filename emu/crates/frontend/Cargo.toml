@@ -30,6 +30,10 @@ native-jit = ["dep:psoxide-jit"]
 # below and never enter the wasm dep graph; the module is additionally
 # `#[cfg(not(target_arch = "wasm32"))]`.
 mcp = ["dep:rmcp", "dep:tokio", "dep:axum", "dep:schemars", "dep:serde", "dep:base64"]
+# `emucap` (native-only) adds the headless `emucap-host` subcommand: PSoXide as
+# an in-process producer for the emucap multi-emulator MCP (emu/crates/psoxide-emucap,
+# which also builds a standalone `psoxide-emucap-host` binary without the GUI stack).
+emucap = ["dep:psoxide-emucap"]
 # Opt-in allocation instrumentation for the ignored, full-project editor
 # preview benchmark. Keeping it off normal test binaries avoids an atomic
 # counter on every allocation in the frontend suite.
@@ -77,6 +81,7 @@ web-time   = "1.1"
 # `cpal` builds on both: native host audio here, WebAudio backend in the wasm table.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 psoxide-jit = { path = "../psoxide-jit", optional = true }
+psoxide-emucap = { workspace = true, optional = true }
 cpal  = { workspace = true }
 gilrs = { workspace = true }
 rfd   = { workspace = true }
