@@ -20,7 +20,9 @@
 //! - [`transport`]: socket/stdio service and the emulator loop.
 //!
 //! [`run`] wires them together for the `psoxide-emucap-host` binary and the
-//! frontend's `emucap-host` subcommand.
+//! frontend's `emucap-host` subcommand. The frontend's `play-session` window
+//! drives the same core from its own loop with [`env_identity`],
+//! [`env_producer`], [`play_after_frame`] and [`transport::drain_jobs`].
 
 pub mod auth;
 pub mod host;
@@ -37,7 +39,7 @@ use clap::{Args, ValueEnum};
 
 use host::{Host, HostIdentity};
 use machine::{BootConfig, Content, Machine, PadProfile};
-use play_session::PlaySession;
+use play_session::{PlaySession, ReplayResult};
 use transport::{serve_jobs, ProducerConfig};
 
 /// Controller profile flag values.
@@ -100,7 +102,7 @@ pub struct HostArgs {
 }
 
 /// Free-running frames between periodic Play-session saves.
-const PLAY_SAVE_FRAMES: u64 = 600;
+pub const PLAY_SAVE_FRAMES: u64 = 600;
 
 /// Stack for the emulator thread. `Bus` is large and debug builds copy it by
 /// value while booting; the 1 MiB Windows main-thread stack is not enough.
@@ -109,17 +111,76 @@ const EMULATOR_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// Boot the machine and serve emucap until the transport ends. The emulator
 /// runs on its own large-stack thread; this call blocks until it exits.
 pub fn run(args: HostArgs) -> Result<(), String> {
+    on_emulator_stack(move || serve(args))?
+}
+
+/// Run `f` on a thread with the emulator's large stack and wait for its
+/// result: booting a `Machine` copies the `Bus` by value.
+pub fn on_emulator_stack<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
     std::thread::Builder::new()
         .name("psx-emucap-emu".into())
         .stack_size(EMULATOR_STACK_BYTES)
-        .spawn(move || serve(args))
+        .spawn(f)
         .map_err(|error| format!("spawn emulator thread: {error}"))?
         .join()
-        .map_err(|_| "emulator thread panicked".to_string())?
+        .map_err(|_| "emulator thread panicked".to_string())
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// The identity a managed launch passes in the environment: `EMUCAP_LAUNCH_ID`,
+/// `EMUCAP_NAME`, `EMUCAP_CONTENT`, and a frozen start when `start_frozen` or
+/// `EMUCAP_START_FROZEN=1`.
+pub fn env_identity(start_frozen: bool) -> HostIdentity {
+    HostIdentity {
+        launch_id: env("EMUCAP_LAUNCH_ID"),
+        name: env("EMUCAP_NAME"),
+        content: env("EMUCAP_CONTENT"),
+        start_frozen: start_frozen || env("EMUCAP_START_FROZEN").as_deref() == Some("1"),
+    }
+}
+
+/// Where and how to connect to emucap: `port`, else `EMUCAP_PORT`, else
+/// 47800, authenticated with `EMUCAP_SESSION_TOKEN` and the identity's launch
+/// id, both of which are required.
+pub fn env_producer(port: Option<u16>, identity: &HostIdentity) -> Result<ProducerConfig, String> {
+    let port = port
+        .or_else(|| env("EMUCAP_PORT").and_then(|p| p.parse().ok()))
+        .unwrap_or(47800);
+    Ok(ProducerConfig {
+        port,
+        front_key: env("EMUCAP_SESSION_TOKEN")
+            .ok_or("EMUCAP_SESSION_TOKEN is required to connect to emucap")?,
+        launch_id: identity
+            .launch_id
+            .clone()
+            .ok_or("EMUCAP_LAUNCH_ID is required to connect to emucap")?,
+    })
+}
+
+/// A Play session's work after every free-running frame, for the headless
+/// loop and the frontend's window alike: check the replay, emit its
+/// `play_replay_result` event, and flush the tape every [`PLAY_SAVE_FRAMES`]
+/// frames. Returns the replay result when this frame produced it.
+pub fn play_after_frame(session: &mut PlaySession, host: &mut Host) -> Option<ReplayResult> {
+    let result = session.after_frame(host.machine_mut());
+    if let Some(result) = result.as_ref() {
+        host.machine_mut().push_event(result.event());
+    }
+    // `save` skips itself while replaying or when the tape was unreadable.
+    if session.frames_since_save() >= PLAY_SAVE_FRAMES {
+        if let Err(error) = session.save(host.machine()) {
+            eprintln!("[emucap] Play session save failed: {error}");
+        }
+    }
+    result
 }
 
 fn serve(args: HostArgs) -> Result<(), String> {
-    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
     let mut config = BootConfig::new(Content::File(args.path.clone()));
     config.pad = match args.pad {
         PadArg::Analog => PadProfile::Analog,
@@ -144,12 +205,7 @@ fn serve(args: HostArgs) -> Result<(), String> {
         .tape
         .clone()
         .map(|path| PlaySession::begin(&mut machine, path));
-    let identity = HostIdentity {
-        launch_id: env("EMUCAP_LAUNCH_ID"),
-        name: env("EMUCAP_NAME"),
-        content: env("EMUCAP_CONTENT"),
-        start_frozen: args.start_frozen || env("EMUCAP_START_FROZEN").as_deref() == Some("1"),
-    };
+    let identity = env_identity(args.start_frozen);
     let mut host = Host::new(machine, identity.clone());
     host.set_play_session(session.is_some());
     let (jobs_tx, jobs_rx) = mpsc::channel();
@@ -168,19 +224,8 @@ fn serve(args: HostArgs) -> Result<(), String> {
                 }
             })
     } else {
-        let port = args
-            .port
-            .or_else(|| env("EMUCAP_PORT").and_then(|p| p.parse().ok()))
-            .unwrap_or(47800);
-        let producer = ProducerConfig {
-            port,
-            front_key: env("EMUCAP_SESSION_TOKEN")
-                .ok_or("EMUCAP_SESSION_TOKEN is required to connect to emucap (or pass --stdio)")?,
-            launch_id: identity
-                .launch_id
-                .clone()
-                .ok_or("EMUCAP_LAUNCH_ID is required to connect to emucap (or pass --stdio)")?,
-        };
+        let producer = env_producer(args.port, &identity)
+            .map_err(|error| format!("{error} (or pass --stdio)"))?;
         std::thread::Builder::new()
             .name("psx-emucap".into())
             .spawn(move || transport::run_producer(&producer, &jobs_tx))
@@ -188,17 +233,8 @@ fn serve(args: HostArgs) -> Result<(), String> {
     .map_err(|error| format!("spawn transport thread: {error}"))?;
 
     let mut after_frame = |host: &mut Host| {
-        let Some(session) = session.as_mut() else {
-            return;
-        };
-        if let Some(result) = session.after_frame(host.machine_mut()) {
-            host.machine_mut().push_event(result.event());
-        }
-        // `save` skips itself while replaying or when the tape was unreadable.
-        if session.frames_since_save() >= PLAY_SAVE_FRAMES {
-            if let Err(error) = session.save(host.machine()) {
-                eprintln!("[emucap] Play session save failed: {error}");
-            }
+        if let Some(session) = session.as_mut() {
+            play_after_frame(session, host);
         }
     };
     serve_jobs(&mut host, &jobs_rx, args.unthrottled, &mut after_frame);

@@ -72,12 +72,8 @@ pub fn serve_jobs(
     let mut next_frame = Instant::now();
     loop {
         if host.run_state() == RunState::Running {
-            loop {
-                match jobs.try_recv() {
-                    Ok(job) => execute(host, job),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
-                }
+            if !drain_jobs(host, jobs) {
+                return;
             }
             if host.run_state() != RunState::Running {
                 continue;
@@ -109,6 +105,20 @@ pub fn serve_jobs(
                 Err(_) => return,
             }
             next_frame = Instant::now();
+        }
+    }
+}
+
+/// Execute every job already queued, without waiting for more: the per-frame
+/// drain of a loop that owns its own pacing (the frontend's play-session
+/// window). Returns false once every sender is gone, after running what they
+/// queued.
+pub fn drain_jobs(host: &mut Host, jobs: &Receiver<Job>) -> bool {
+    loop {
+        match jobs.try_recv() {
+            Ok(job) => execute(host, job),
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => return false,
         }
     }
 }
@@ -378,6 +388,46 @@ mod tests {
         assert_eq!(producer.join().unwrap(), SessionEnd::Disconnected);
         // The producer dropped its job sender; the emulator loop ends.
         emulator.join().unwrap();
+    }
+
+    #[test]
+    fn drain_jobs_runs_every_queued_job_and_reports_when_the_senders_are_gone() {
+        let machine = Machine::boot(BootConfig::new(Content::ExeBytes {
+            label: "spin.exe".into(),
+            bytes: spin_exe(),
+        }))
+        .unwrap();
+        let mut host = Host::new(
+            machine,
+            HostIdentity {
+                start_frozen: true,
+                ..Default::default()
+            },
+        );
+        let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        for (id, frames) in [(1, 2), (2, 3)] {
+            let line = json!({"v": 1, "id": id, "method": "step", "params": {"frames": frames}});
+            jobs_tx
+                .send(Job {
+                    request: Request::parse(&line.to_string()).unwrap(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    reply: reply_tx.clone(),
+                })
+                .unwrap();
+        }
+
+        assert!(drain_jobs(&mut host, &jobs_rx), "a sender is still alive");
+        let replies: Vec<Response> = reply_rx.try_iter().collect();
+        assert_eq!(replies.len(), 2, "both queued jobs ran in one drain");
+        assert_eq!(host.machine().frame(), 5, "in order, to completion");
+        assert!(
+            drain_jobs(&mut host, &jobs_rx),
+            "an empty queue is not the end"
+        );
+
+        drop(jobs_tx);
+        assert!(!drain_jobs(&mut host, &jobs_rx), "every sender is gone");
     }
 
     #[test]

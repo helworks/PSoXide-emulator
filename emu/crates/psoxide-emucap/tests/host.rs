@@ -1085,3 +1085,29 @@ fn rom_info_hashes_the_booted_image() {
     assert_eq!(info["system"], "psx");
     assert_eq!(info["media_type"], "exe");
 }
+
+#[test]
+fn captured_audio_waits_for_the_frontend_and_stays_bounded() {
+    use psoxide_emucap::machine::AUDIO_CAPTURE_SAMPLES;
+
+    // One route tick is one NTSC vblank: about 735 SPU samples at 44.1 kHz.
+    let mut host = host();
+    ok(&mut host, "step", json!({"frames": 3}));
+    assert!(
+        host.machine_mut().drain_audio().len() < 2,
+        "headless drops the SPU output every frame"
+    );
+
+    host.machine_mut().set_audio_capture(true);
+    ok(&mut host, "step", json!({"frames": 3}));
+    assert!(
+        host.machine_mut().drain_audio().len() > 2_000,
+        "captured output is kept for the frontend"
+    );
+
+    ok(&mut host, "step", json!({"frames": 120}));
+    assert!(
+        host.machine_mut().drain_audio().len() <= AUDIO_CAPTURE_SAMPLES + 1,
+        "a long advance between drains cannot grow the queue without bound"
+    );
+}

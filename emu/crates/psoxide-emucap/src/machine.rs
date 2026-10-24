@@ -36,6 +36,12 @@ pub const POLL_FRAME_BUDGET: u64 = 600;
 /// Events retained for `poll_events` before the oldest is dropped.
 const MAX_EVENTS: usize = 1024;
 
+/// Stereo SPU samples (a quarter second at 44.1 kHz) a machine capturing audio
+/// keeps for [`Machine::drain_audio`]. A longer backlog -- an agent advanced
+/// many frames between two drains -- is dropped at the next frame end, so the
+/// queue never grows without bound and never plays back seconds late.
+pub const AUDIO_CAPTURE_SAMPLES: usize = 44_100 / 4;
+
 /// How the port-1 controller is presented at boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PadProfile {
@@ -266,6 +272,7 @@ pub struct Machine {
     port1_hold_neutral: bool,
     recording: bool,
     recorded: Vec<PadSample>,
+    audio_capture: bool,
     game_hash: u64,
     poll_offset: u64,
     exact_poll_stepping: bool,
@@ -302,6 +309,7 @@ impl Machine {
             port1_hold_neutral: false,
             recording: false,
             recorded: Vec::new(),
+            audio_capture: false,
             game_hash,
             poll_offset: 0,
             exact_poll_stepping: false,
@@ -892,8 +900,14 @@ impl Machine {
         self.restart_tick_clock();
         // Keep the SPU caught up and its host queue drained, as the GUI's
         // audio path does every frame; the guest never sees the drained samples.
+        // A capturing machine leaves the queue to `drain_audio` up to its cap.
         self.bus.run_spu_to_current_cycle();
-        if self.bus.spu.audio_queue_len() != 0 {
+        let keep = if self.audio_capture {
+            AUDIO_CAPTURE_SAMPLES
+        } else {
+            0
+        };
+        if self.bus.spu.audio_queue_len() > keep {
             let _ = self.bus.spu.drain_audio();
         }
         let video_tape = self
@@ -990,6 +1004,23 @@ impl Machine {
     /// `launch --dump-hash` / `--visual-hash-log` `display_fnv1a_64` value.
     pub fn display_hash(&self) -> (u64, u32, u32, usize) {
         self.bus.gpu.display_hash()
+    }
+
+    // --- audio --------------------------------------------------------------
+
+    /// Keep the SPU's host output for [`Machine::drain_audio`] instead of
+    /// dropping it at every frame end: for a frontend with an audio device.
+    /// At most [`AUDIO_CAPTURE_SAMPLES`] are kept between two drains.
+    pub fn set_audio_capture(&mut self, on: bool) {
+        self.audio_capture = on;
+    }
+
+    /// Catch the SPU up to the current cycle and take its queued host output,
+    /// as the GUI's audio path does after every frame. Host-side only: the
+    /// guest never sees what is drained.
+    pub fn drain_audio(&mut self) -> Vec<(i16, i16)> {
+        self.bus.run_spu_to_current_cycle();
+        self.bus.spu.drain_audio()
     }
 
     /// Mutable bus access for memory writes.
