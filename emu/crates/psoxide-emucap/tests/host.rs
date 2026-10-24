@@ -739,6 +739,7 @@ fn video_frame_and_poll_bound_tapes_drive_port_one() {
             PadSample::from_buttons(TRIANGLE),
         ],
         2,
+        None,
     )
     .unwrap();
     let started = ok(

@@ -135,7 +135,7 @@ impl PlaytestInputTape {
     /// a timestamped copy beside it.
     pub(crate) fn stop_recording(&mut self, path: &Path) -> Result<usize, String> {
         let frames = self.finish_recording();
-        write_tape_poll_bound(path, &self.samples, self.start_poll)?;
+        write_tape_poll_bound(path, &self.samples, self.start_poll, None)?;
         save_timestamped_copy(path)?;
         Ok(frames)
     }
@@ -472,6 +472,7 @@ mod tests {
             clock: TapeClock::PadPoll,
             start_poll: 2,
             game_hash: None,
+            end: None,
         };
         let mut replay = PlaytestInputTape::default();
         assert_eq!(replay.start_replay_from_tape(tape).unwrap(), 1);

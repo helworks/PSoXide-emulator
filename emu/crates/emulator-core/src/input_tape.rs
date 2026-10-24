@@ -31,6 +31,10 @@ const TAPE_HEADER_BYTES: usize = 12;
 /// poll index the recording started at.
 const TAPE_POLL_MAGIC: &[u8; 8] = b"PXITAPE2";
 const TAPE_POLL_HEADER_BYTES: usize = 16;
+/// Poll-bound tape with an end marker: `PXITAPE2`'s header plus the end
+/// frame, end display hash and game hash (0 = unknown).
+const TAPE_END_MAGIC: &[u8; 8] = b"PXITAPE3";
+const TAPE_END_HEADER_BYTES: usize = 40;
 const TAPE_SAMPLE_BYTES: usize = 6;
 const TAPE_CSV_HEADER: &str = "frame,buttons,right_x,right_y,left_x,left_y";
 /// v2 CSVs open with a metadata line carrying what the bare v1 header could
@@ -67,6 +71,20 @@ pub struct Tape {
     /// when the recorder knew it. Advisory: a mismatch on replay means the
     /// game bytes changed, which may or may not desync the tape.
     pub game_hash: Option<u64>,
+    /// Where a recorded run ended and what the screen showed there, for
+    /// `PXITAPE3` tapes. Replay compares the display at `end.frame` against
+    /// `end.display_hash` to tell whether it reached the recorded state.
+    pub end: Option<TapeEnd>,
+}
+
+/// The recorded end of a poll-bound tape: the video frame the run stopped on
+/// and the hash of the display at that frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapeEnd {
+    /// Emulated video frame the recording ended on.
+    pub frame: u64,
+    /// Hash of the displayed frame at `frame`.
+    pub display_hash: u64,
 }
 
 /// FNV-1a 64 over a game image, recorded into tapes so replay can tell the
@@ -348,15 +366,18 @@ pub fn tape_from_csv(csv: &str) -> Result<Tape, String> {
         clock,
         start_poll,
         game_hash,
+        end: None,
     })
 }
 
-/// Serialize poll-bound samples as `PXITAPE2`. `start_poll` is the port-1
-/// completed-poll count at which sample 0 was captured.
+/// Serialize poll-bound samples as `PXITAPE2`, or as `PXITAPE3` when `end`
+/// is given. `start_poll` is the port-1 completed-poll count at which sample
+/// 0 was captured.
 pub fn write_tape_poll_bound(
     path: &Path,
     samples: &[PadSample],
     start_poll: u64,
+    end: Option<TapeEnd>,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -364,14 +385,36 @@ pub fn write_tape_poll_bound(
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
     }
+    let bytes = tape_poll_bound_bytes(samples, start_poll, end, None)?;
+    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// The bytes [`write_tape_poll_bound`] writes: `PXITAPE2` when `end` is
+/// `None`, `PXITAPE3` otherwise. `game_hash` is only stored in `PXITAPE3`
+/// (as 0 when unknown), since `PXITAPE2` has no room for it.
+pub fn tape_poll_bound_bytes(
+    samples: &[PadSample],
+    start_poll: u64,
+    end: Option<TapeEnd>,
+    game_hash: Option<u64>,
+) -> Result<Vec<u8>, String> {
     let sample_count = u32::try_from(samples.len())
         .map_err(|_| format!("input tape too large: {} polls", samples.len()))?;
     let start = u32::try_from(start_poll)
         .map_err(|_| format!("input tape start poll too large: {start_poll}"))?;
-    let mut bytes = Vec::with_capacity(TAPE_POLL_HEADER_BYTES + samples.len() * TAPE_SAMPLE_BYTES);
-    bytes.extend_from_slice(TAPE_POLL_MAGIC);
+    let mut bytes = Vec::with_capacity(TAPE_END_HEADER_BYTES + samples.len() * TAPE_SAMPLE_BYTES);
+    bytes.extend_from_slice(if end.is_some() {
+        TAPE_END_MAGIC
+    } else {
+        TAPE_POLL_MAGIC
+    });
     bytes.extend_from_slice(&sample_count.to_le_bytes());
     bytes.extend_from_slice(&start.to_le_bytes());
+    if let Some(end) = end {
+        bytes.extend_from_slice(&end.frame.to_le_bytes());
+        bytes.extend_from_slice(&end.display_hash.to_le_bytes());
+        bytes.extend_from_slice(&game_hash.unwrap_or(0).to_le_bytes());
+    }
     for s in samples {
         bytes.extend_from_slice(&s.buttons.to_le_bytes());
         bytes.push(s.right_x);
@@ -379,13 +422,31 @@ pub fn write_tape_poll_bound(
         bytes.push(s.left_x);
         bytes.push(s.left_y);
     }
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+    Ok(bytes)
 }
 
-/// Parse a tape from raw bytes, sniffing the format: `PXITAPE2`, `PXITAPE1`,
+/// Parse a tape from raw bytes, sniffing the format: `PXITAPE3`, `PXITAPE2`, `PXITAPE1`,
 /// or CSV (v1 or v2). This is the browser-upload entry point; the path-based
 /// readers below wrap it.
 pub fn tape_from_bytes(bytes: &[u8]) -> Result<Tape, String> {
+    if bytes.len() >= TAPE_END_HEADER_BYTES && &bytes[..TAPE_END_MAGIC.len()] == TAPE_END_MAGIC {
+        let count = u32::from_le_bytes(bytes[8..12].try_into().expect("count slice")) as usize;
+        let start_poll = u32::from_le_bytes(bytes[12..16].try_into().expect("start slice")) as u64;
+        let frame = u64::from_le_bytes(bytes[16..24].try_into().expect("end frame slice"));
+        let display_hash = u64::from_le_bytes(bytes[24..32].try_into().expect("end hash slice"));
+        let game_hash = u64::from_le_bytes(bytes[32..40].try_into().expect("game hash slice"));
+        let samples = decode_binary_samples(bytes, TAPE_END_HEADER_BYTES, count, "poll")?;
+        return Ok(Tape {
+            samples,
+            clock: TapeClock::PadPoll,
+            start_poll,
+            game_hash: (game_hash != 0).then_some(game_hash),
+            end: Some(TapeEnd {
+                frame,
+                display_hash,
+            }),
+        });
+    }
     if bytes.len() >= TAPE_POLL_HEADER_BYTES && &bytes[..TAPE_POLL_MAGIC.len()] == TAPE_POLL_MAGIC {
         let count = u32::from_le_bytes(bytes[8..12].try_into().expect("count slice")) as usize;
         let start_poll = u32::from_le_bytes(bytes[12..16].try_into().expect("start slice")) as u64;
@@ -395,6 +456,7 @@ pub fn tape_from_bytes(bytes: &[u8]) -> Result<Tape, String> {
             clock: TapeClock::PadPoll,
             start_poll,
             game_hash: None,
+            end: None,
         });
     }
     if bytes.len() >= TAPE_HEADER_BYTES && &bytes[..TAPE_MAGIC.len()] == TAPE_MAGIC {
@@ -409,6 +471,7 @@ pub fn tape_from_bytes(bytes: &[u8]) -> Result<Tape, String> {
             clock: TapeClock::VideoFrame,
             start_poll: 0,
             game_hash: None,
+            end: None,
         });
     }
     let csv = std::str::from_utf8(bytes)
@@ -570,7 +633,7 @@ mod tests {
 
         let dir = std::env::temp_dir();
         let poll_path = dir.join(format!("psoxide-sniff-poll-{}.pxtape", std::process::id()));
-        write_tape_poll_bound(&poll_path, &samples, 42).expect("write poll tape");
+        write_tape_poll_bound(&poll_path, &samples, 42, None).expect("write poll tape");
         let poll = tape_from_bytes(&std::fs::read(&poll_path).unwrap()).unwrap();
         let _ = std::fs::remove_file(&poll_path);
         assert_eq!(poll.clock, TapeClock::PadPoll);
@@ -592,6 +655,49 @@ mod tests {
         assert_eq!(parsed.samples, samples);
 
         assert!(tape_from_bytes(&[0xff, 0xfe, 0x00]).is_err());
+    }
+
+    #[test]
+    fn poll_bound_tape_with_end_round_trips() {
+        let samples = vec![
+            PadSample::from_buttons(0x0001),
+            PadSample::from_buttons(0x4000),
+        ];
+        let end = TapeEnd {
+            frame: 1234,
+            display_hash: 0xdead_beef_0000_0001,
+        };
+        let bytes = tape_poll_bound_bytes(&samples, 7, Some(end), Some(42)).unwrap();
+        assert_eq!(&bytes[..8], b"PXITAPE3");
+        let tape = tape_from_bytes(&bytes).unwrap();
+        assert_eq!(tape.samples, samples);
+        assert_eq!(tape.clock, TapeClock::PadPoll);
+        assert_eq!(tape.start_poll, 7);
+        assert_eq!(tape.end, Some(end));
+        assert_eq!(tape.game_hash, Some(42));
+    }
+
+    #[test]
+    fn pxitape2_reads_with_no_end() {
+        let samples = vec![PadSample::from_buttons(0x0001)];
+        let bytes = tape_poll_bound_bytes(&samples, 3, None, None).unwrap();
+        assert_eq!(&bytes[..8], b"PXITAPE2");
+        let tape = tape_from_bytes(&bytes).unwrap();
+        assert_eq!(tape.end, None);
+        assert_eq!(tape.start_poll, 3);
+        assert_eq!(tape.samples, samples);
+    }
+
+    #[test]
+    fn truncated_pxitape3_is_rejected() {
+        let samples = vec![PadSample::from_buttons(0x0001)];
+        let end = TapeEnd {
+            frame: 1,
+            display_hash: 2,
+        };
+        let mut bytes = tape_poll_bound_bytes(&samples, 0, Some(end), None).unwrap();
+        bytes.pop();
+        assert!(tape_from_bytes(&bytes).is_err());
     }
 
     #[test]

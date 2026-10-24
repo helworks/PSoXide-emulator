@@ -1382,7 +1382,7 @@ mod tests {
             PadSample::from_buttons(2),
             PadSample::from_buttons(4),
         ];
-        write_tape_poll_bound(&file, &samples, 4).unwrap();
+        write_tape_poll_bound(&file, &samples, 4, None).unwrap();
         let original = std::fs::read(&file).unwrap();
 
         let (absolute, absolute_note) = load_step_tape(&file, "route.pxtape", false, 100).unwrap();

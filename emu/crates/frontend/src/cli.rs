@@ -2218,7 +2218,7 @@ fn run_headless_launch(
         for _ in 0..bus.port1_completed_polls().saturating_sub(transcript_polls) {
             transcript.push(transcript_live);
         }
-        emulator_core::input_tape::write_tape_poll_bound(path, &transcript, 0)?;
+        emulator_core::input_tape::write_tape_poll_bound(path, &transcript, 0, None)?;
         if emit_summary {
             eprintln!(
                 "[cli] transcribed {} polls to {}",
