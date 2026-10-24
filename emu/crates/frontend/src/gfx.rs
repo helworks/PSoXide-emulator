@@ -469,6 +469,14 @@ impl Graphics {
         if !needs_cpu_display {
             return;
         }
+        self.upload_display(gpu, deinterlace);
+    }
+
+    /// Upload the CPU rasterizer's visible display area into the display
+    /// texture ([`Graphics::display_texture_id`]) unconditionally, for a
+    /// presenter that only has a `&Gpu` and so cannot drive the HW renderer's
+    /// command log (the play-session window).
+    pub fn upload_display(&self, gpu: &Gpu, deinterlace: emulator_core::Deinterlace) {
         let (rgba, width, height) = gpu.display_rgba8_with(deinterlace);
         if width == 0 || height == 0 || rgba.is_empty() {
             self.clear_display_texture();

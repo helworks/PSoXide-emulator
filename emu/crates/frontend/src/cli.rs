@@ -83,7 +83,8 @@ pub struct Cli {
     /// default borderless-fullscreen mode. Useful when developing
     /// with the editor side-by-side with a terminal or docs. Only
     /// meaningful when no headless subcommand is given --
-    /// subcommands always run windowless.
+    /// subcommands run windowless, except `play-session`, which takes
+    /// its own `--windowed`.
     #[arg(long)]
     pub windowed: bool,
 
@@ -206,6 +207,13 @@ pub enum Command {
     /// states) to its Control MCP, or on stdin/stdout with `--stdio`.
     #[cfg(feature = "emucap")]
     EmucapHost(psoxide_emucap::HostArgs),
+
+    /// Open a window on a Play session: replay the session tape from boot to
+    /// its recorded end, hand port 1 to the keyboard and gamepads, record the
+    /// whole session back to the tape, and (with `--emucap`) serve emucap from
+    /// inside the window. The only subcommand that opens a window.
+    #[cfg(feature = "emucap")]
+    PlaySession(crate::play_session_window::PlaySessionArgs),
 }
 
 /// Arguments for `input-probe`.
@@ -785,6 +793,8 @@ pub fn run(cli: Cli) -> Result<(), String> {
         Command::InputProbe(args) => crate::input::probe::run(args.seconds),
         #[cfg(feature = "emucap")]
         Command::EmucapHost(args) => psoxide_emucap::run(args),
+        #[cfg(feature = "emucap")]
+        Command::PlaySession(args) => crate::play_session_window::run(&paths, args),
     }
 }
 

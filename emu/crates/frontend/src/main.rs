@@ -57,6 +57,9 @@ mod input;
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 mod mcp;
 mod pacing;
+// `play-session`: a window driven by psoxide-emucap's Play core.
+#[cfg(all(feature = "emucap", not(target_arch = "wasm32")))]
+mod play_session_window;
 #[cfg(feature = "editor")]
 #[rustfmt::skip]
 mod playtest_disc;
@@ -166,7 +169,9 @@ fn paths_equivalent(path: &Path, other: &Path) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     // Argument parsing first -- if a subcommand is present, we
-    // dispatch through the headless CLI and never open a window.
+    // dispatch through the headless CLI and never open this shell's
+    // window. (`play-session` opens its own window from there, without
+    // the menu, the editor or the `mcp` server.)
     // Clap's derive API panics with a nicely-formatted message on
     // bad arguments, which is exactly what a CLI user expects.
     let cli = Cli::parse();
