@@ -115,12 +115,32 @@ pub struct Host {
     identity: HostIdentity,
     run_state: RunState,
     rom_info: Option<Value>,
+    play_session: bool,
 }
 
 type HostResult = Result<Value, (&'static str, String)>;
 
 fn bad_params(message: impl Into<String>) -> (&'static str, String) {
     ("bad_params", message.into())
+}
+
+/// Message for every method refused while a Play session records.
+const PLAY_SESSION_REFUSAL: &str =
+    "a Play session owns input and state; stop the session to inject";
+
+/// Whether `method` would put input or state into the guest outside the Play
+/// session's tape: input setting, memory writes, state restore, reset, and
+/// starting or stopping an input tape. Reads, screenshots, run control, steps,
+/// polls and breakpoints are not injection.
+fn injects_input_or_state(method: &str, params: &Map<String, Value>) -> bool {
+    match method {
+        "set_input" | "press_buttons" | "write_memory" | "load_state" | "reset" => true,
+        "psoxide_input_tape" => matches!(
+            params.get("action").and_then(Value::as_str),
+            Some("start" | "stop")
+        ),
+        _ => false,
+    }
 }
 
 fn bad_state(message: impl Into<String>) -> (&'static str, String) {
@@ -141,7 +161,15 @@ impl Host {
             identity,
             run_state,
             rom_info: None,
+            play_session: false,
         }
+    }
+
+    /// Turn Play-session mode on or off. While on, the host refuses every method
+    /// that puts input or state into the guest outside the session's tape, so the
+    /// recorded tape stays a faithful record of the run.
+    pub fn set_play_session(&mut self, on: bool) {
+        self.play_session = on;
     }
 
     /// The machine, for the emulator loop.
@@ -189,6 +217,9 @@ impl Host {
                 "unsupported",
                 format!("{key}: owned temporal control is not implemented by the PSoXide host"),
             );
+        }
+        if self.play_session && injects_input_or_state(&request.method, params) {
+            return Response::err(request.id, "bad_state", PLAY_SESSION_REFUSAL);
         }
         let result = match request.method.as_str() {
             "hello" => Ok(self.hello()),
@@ -278,6 +309,14 @@ impl Host {
             "capability_notes": capability_notes(),
         });
         let object = value.as_object_mut().expect("hello is an object");
+        if self.play_session {
+            if let Some(notes) = object
+                .get_mut("capability_notes")
+                .and_then(Value::as_object_mut)
+            {
+                notes.insert("play_session".into(), json!(true));
+            }
+        }
         if let Some(name) = &self.identity.name {
             object.insert("name".into(), json!(name));
         }

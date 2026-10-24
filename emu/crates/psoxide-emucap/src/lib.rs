@@ -151,6 +151,7 @@ fn serve(args: HostArgs) -> Result<(), String> {
         start_frozen: args.start_frozen || env("EMUCAP_START_FROZEN").as_deref() == Some("1"),
     };
     let mut host = Host::new(machine, identity.clone());
+    host.set_play_session(session.is_some());
     let (jobs_tx, jobs_rx) = mpsc::channel();
 
     let transport = if args.stdio {

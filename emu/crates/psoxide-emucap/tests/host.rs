@@ -964,6 +964,70 @@ fn reset_reboots_and_keeps_the_persistent_override() {
 }
 
 #[test]
+fn play_session_refuses_input_injection() {
+    let mut host = host();
+    host.set_play_session(true);
+    let tape = scratch_dir("play-refuse").join("x.pxitape");
+    let tape = tape.display().to_string();
+    let cases = [
+        ("set_input", json!({"buttons": ["start"]})),
+        ("press_buttons", json!({"buttons": ["start"]})),
+        (
+            "write_memory",
+            json!({"memory_type": "ram", "address": 0, "hex": "00"}),
+        ),
+        ("load_state", json!({"path": tape})),
+        ("reset", json!({})),
+        (
+            "psoxide_input_tape",
+            json!({"action": "start", "path": tape}),
+        ),
+        ("psoxide_input_tape", json!({"action": "stop"})),
+    ];
+    for (method, params) in cases {
+        let response = call(&mut host, method, params);
+        assert!(!response.ok, "{method} was not refused");
+        let error = response.error.unwrap();
+        assert_eq!(error.kind, "bad_state", "{method}");
+        assert_eq!(
+            error.message,
+            "a Play session owns input and state; stop the session to inject"
+        );
+    }
+    let hello = ok(&mut host, "hello", json!({}));
+    assert_eq!(hello["capability_notes"]["play_session"], true);
+
+    host.set_play_session(false);
+    ok(&mut host, "set_input", json!({"buttons": ["start"]}));
+}
+
+#[test]
+fn play_session_allows_reads_and_steps() {
+    let mut host = host();
+    host.set_play_session(true);
+    ok(&mut host, "step", json!({"frames": 2}));
+    ok(&mut host, "step_instructions", json!({"count": 10}));
+    ok(&mut host, "step_input_polls", json!({"count": 1}));
+    read_u32(&mut host, COUNTER);
+    ok(&mut host, "psoxide_input_tape", json!({"action": "status"}));
+    ok(&mut host, "psoxide_hashes", json!({}));
+    ok(&mut host, "get_state", json!({}));
+    ok(&mut host, "pause", json!({}));
+    ok(&mut host, "resume", json!({}));
+    ok(&mut host, "list_breakpoints", json!({}));
+    ok(&mut host, "poll_events", json!({}));
+    // A display-less guest refuses screenshots with a state error, not the
+    // Play-session refusal.
+    let response = call(&mut host, "screenshot", json!({}));
+    if let Some(error) = response.error {
+        assert_ne!(
+            error.message,
+            "a Play session owns input and state; stop the session to inject"
+        );
+    }
+}
+
+#[test]
 fn screenshots_are_png_with_provenance() {
     let mut host = host();
     // The synthetic guest never programs the GPU display: an explicit failure,
