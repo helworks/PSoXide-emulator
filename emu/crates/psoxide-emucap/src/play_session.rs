@@ -167,6 +167,8 @@ impl PlaySession {
             .game_hash
             .is_some_and(|hash| hash != machine.game_hash());
         session.end = Some(end);
+        // No advance runs past the end frame before the hand-over check.
+        machine.set_frame_stop(Some(end.frame));
         machine.set_port1_hold_neutral(true);
         if !tape.samples.is_empty() {
             let source = session.path.display().to_string();
@@ -190,10 +192,13 @@ impl PlaySession {
         self.end.is_some()
     }
 
-    /// Call after every frame. Returns the replay's result exactly once: right
-    /// after `begin` when there was nothing to replay, otherwise at the first
-    /// frame boundary at or past the recorded end frame, where the tape is
-    /// stopped, the display compared, and port 1 handed to live input.
+    /// Call after every advance. Returns the replay's result exactly once:
+    /// right after `begin` when there was nothing to replay, otherwise at the
+    /// frame boundary where the frame counter reaches the recorded end frame,
+    /// where the tape is stopped, the display compared, and port 1 handed to
+    /// live input. Until then the machine's frame stop holds every advance at
+    /// that boundary, so it is never overrun. [`crate::host::Host`] calls it
+    /// after each advance it runs, whoever asked for it.
     pub fn after_frame(&mut self, machine: &mut Machine) -> Option<ReplayResult> {
         self.frame = machine.frame();
         if let Some(result) = self.immediate.take() {
@@ -204,6 +209,7 @@ impl PlaySession {
             return None;
         }
         self.end = None;
+        machine.set_frame_stop(None);
         if machine
             .tape()
             .is_some_and(|tape| tape.source == self.source())

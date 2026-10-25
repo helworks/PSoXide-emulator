@@ -22,7 +22,9 @@
 //! [`run`] wires them together for the `psoxide-emucap-host` binary and the
 //! frontend's `emucap-host` subcommand. The frontend's `play-session` window
 //! drives the same core from its own loop with [`env_identity`],
-//! [`env_producer`], [`play_after_frame`] and [`transport::drain_jobs`].
+//! [`env_producer`], [`host::Host::begin_play_session`] and
+//! [`transport::drain_jobs`]; the Play session's per-advance work runs inside
+//! the host, so agent steps and free-running frames get the same hand-over.
 
 pub mod auth;
 pub mod host;
@@ -39,7 +41,6 @@ use clap::{Args, ValueEnum};
 
 use host::{Host, HostIdentity};
 use machine::{BootConfig, Content, Machine, PadProfile};
-use play_session::{PlaySession, ReplayResult};
 use transport::{serve_jobs, ProducerConfig};
 
 /// Controller profile flag values.
@@ -101,8 +102,7 @@ pub struct HostArgs {
     pub tape: Option<PathBuf>,
 }
 
-/// Free-running frames between periodic Play-session saves.
-pub const PLAY_SAVE_FRAMES: u64 = 600;
+pub use host::PLAY_SAVE_FRAMES;
 
 /// Stack for the emulator thread. `Bus` is large and debug builds copy it by
 /// value while booting; the 1 MiB Windows main-thread stack is not enough.
@@ -162,24 +162,6 @@ pub fn env_producer(port: Option<u16>, identity: &HostIdentity) -> Result<Produc
     })
 }
 
-/// A Play session's work after every free-running frame, for the headless
-/// loop and the frontend's window alike: check the replay, emit its
-/// `play_replay_result` event, and flush the tape every [`PLAY_SAVE_FRAMES`]
-/// frames. Returns the replay result when this frame produced it.
-pub fn play_after_frame(session: &mut PlaySession, host: &mut Host) -> Option<ReplayResult> {
-    let result = session.after_frame(host.machine_mut());
-    if let Some(result) = result.as_ref() {
-        host.machine_mut().push_event(result.event());
-    }
-    // `save` skips itself while replaying or when the tape was unreadable.
-    if session.frames_since_save() >= PLAY_SAVE_FRAMES {
-        if let Err(error) = session.save(host.machine()) {
-            eprintln!("[emucap] Play session save failed: {error}");
-        }
-    }
-    result
-}
-
 fn serve(args: HostArgs) -> Result<(), String> {
     let mut config = BootConfig::new(Content::File(args.path.clone()));
     config.pad = match args.pad {
@@ -201,13 +183,11 @@ fn serve(args: HostArgs) -> Result<(), String> {
             path.display().to_string(),
         )?;
     }
-    let mut session = args
-        .tape
-        .clone()
-        .map(|path| PlaySession::begin(&mut machine, path));
     let identity = env_identity(args.start_frozen);
     let mut host = Host::new(machine, identity.clone());
-    host.set_play_session(session.is_some());
+    if let Some(path) = args.tape.clone() {
+        host.begin_play_session(path);
+    }
     let (jobs_tx, jobs_rx) = mpsc::channel();
 
     let transport = if args.stdio {
@@ -232,15 +212,8 @@ fn serve(args: HostArgs) -> Result<(), String> {
     }
     .map_err(|error| format!("spawn transport thread: {error}"))?;
 
-    let mut after_frame = |host: &mut Host| {
-        if let Some(session) = session.as_mut() {
-            play_after_frame(session, host);
-        }
-    };
-    serve_jobs(&mut host, &jobs_rx, args.unthrottled, &mut after_frame);
+    serve_jobs(&mut host, &jobs_rx, args.unthrottled);
     let _ = transport.join();
-    if let Some(session) = session.as_ref() {
-        session.save(host.machine())?;
-    }
+    host.save_play_session()?;
     Ok(())
 }

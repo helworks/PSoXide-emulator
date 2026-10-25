@@ -21,7 +21,11 @@ use crate::machine::{
     button_bit, button_names, AdvanceControl, Content, Machine, PortInput, Stop, Unit,
 };
 use crate::memory::{self, MemoryType};
+use crate::play_session::{PlaySession, ReplayResult};
 use crate::wire::{Request, Response, PROTOCOL_VERSION};
+
+/// Advanced frames between periodic Play-session saves.
+pub const PLAY_SAVE_FRAMES: u64 = 600;
 
 /// emucap's synchronous advance cap (`live::temporal::MAX_SYNC_ADVANCE_COUNT`).
 pub const MAX_SYNC_ADVANCE_COUNT: u64 = 5_000;
@@ -115,7 +119,10 @@ pub struct Host {
     identity: HostIdentity,
     run_state: RunState,
     rom_info: Option<Value>,
-    play_session: bool,
+    /// The Play session recording this run, if one is on.
+    play: Option<PlaySession>,
+    /// The Play session's replay result, once it has one.
+    replay_result: Option<ReplayResult>,
 }
 
 type HostResult = Result<Value, (&'static str, String)>;
@@ -161,15 +168,65 @@ impl Host {
             identity,
             run_state,
             rom_info: None,
-            play_session: false,
+            play: None,
+            replay_result: None,
         }
     }
 
-    /// Turn Play-session mode on or off. While on, the host refuses every method
-    /// that puts input or state into the guest outside the session's tape, so the
-    /// recorded tape stays a faithful record of the run.
-    pub fn set_play_session(&mut self, on: bool) {
-        self.play_session = on;
+    /// Start a Play session on the freshly booted machine, bound to the tape at
+    /// `tape` ([`PlaySession::begin`]). From now on the host refuses every
+    /// method that puts input or state into the guest outside the session's
+    /// tape, so the recorded tape stays a faithful record of the run, and runs
+    /// the session's per-advance work ([`Host::play_check`]) around every
+    /// advance, free-running or agent-requested.
+    pub fn begin_play_session(&mut self, tape: PathBuf) {
+        self.play = Some(PlaySession::begin(&mut self.machine, tape));
+    }
+
+    /// The Play session, if one is on.
+    pub fn play_session(&self) -> Option<&PlaySession> {
+        self.play.as_ref()
+    }
+
+    /// Whether a Play session is still replaying its tape.
+    pub fn play_replaying(&self) -> bool {
+        self.play.as_ref().is_some_and(PlaySession::replaying)
+    }
+
+    /// The Play session's replay result, once it has one.
+    pub fn replay_result(&self) -> Option<&ReplayResult> {
+        self.replay_result.as_ref()
+    }
+
+    /// Save the Play session's tape ([`PlaySession::save`]). `Ok(false)` when
+    /// there is no session or it would not write.
+    pub fn save_play_session(&self) -> Result<bool, String> {
+        match self.play.as_ref() {
+            Some(session) => session.save(&self.machine),
+            None => Ok(false),
+        }
+    }
+
+    /// The Play session's work after an advance: check the replay (its
+    /// `play_replay_result` event is queued when it produces one), and flush
+    /// the tape every [`PLAY_SAVE_FRAMES`] frames. Returns the replay result
+    /// when this call produced it. While the replay is on, the machine's frame
+    /// stop holds every advance at the replay's end frame, so this runs there
+    /// exactly once whoever advanced.
+    fn play_check(&mut self) -> Option<ReplayResult> {
+        let session = self.play.as_mut()?;
+        let result = session.after_frame(&mut self.machine);
+        if let Some(result) = result.as_ref() {
+            self.machine.push_event(result.event());
+            self.replay_result = Some(result.clone());
+        }
+        // `save` skips itself while replaying or when the tape must be kept.
+        if session.frames_since_save() >= PLAY_SAVE_FRAMES {
+            if let Err(error) = session.save(&self.machine) {
+                eprintln!("[emucap] Play session save failed: {error}");
+            }
+        }
+        result
     }
 
     /// The machine, for the emulator loop.
@@ -189,16 +246,19 @@ impl Host {
     }
 
     /// Advance one frame of free-running emulation (the emulator loop's job
-    /// while running). Faults or tape stops freeze the machine.
+    /// while running), with a Play session's per-advance work around it.
+    /// Faults or tape stops freeze the machine.
     pub fn run_free_frame(&mut self) {
         if self.run_state != RunState::Running {
             return;
         }
+        self.play_check();
         let control = AdvanceControl {
             deadline: Instant::now() + ADVANCE_BUDGET,
             cancel: None,
         };
         let advance = self.machine.advance(Unit::Frames, 1, &control);
+        self.play_check();
         if advance.stop != Stop::Completed {
             self.run_state = RunState::Frozen;
         }
@@ -218,7 +278,7 @@ impl Host {
                 format!("{key}: owned temporal control is not implemented by the PSoXide host"),
             );
         }
-        if self.play_session && injects_input_or_state(&request.method, params) {
+        if self.play.is_some() && injects_input_or_state(&request.method, params) {
             return Response::err(request.id, "bad_state", PLAY_SESSION_REFUSAL);
         }
         let result = match request.method.as_str() {
@@ -309,7 +369,7 @@ impl Host {
             "capability_notes": capability_notes(),
         });
         let object = value.as_object_mut().expect("hello is an object");
-        if self.play_session {
+        if self.play.is_some() {
             if let Some(notes) = object
                 .get_mut("capability_notes")
                 .and_then(Value::as_object_mut)
@@ -619,6 +679,10 @@ impl Host {
     }
 
     /// Run an advance and describe it. The machine is frozen afterwards.
+    ///
+    /// While a Play session replays, the advance stops at the replay's end
+    /// frame (`reason: play_replay_end` when that cut it short), the hand-over
+    /// check runs there, and its result is reported as `play_replay_result`.
     fn advance_json(&mut self, unit: Unit, count: u64, cancel: Option<&AtomicBool>) -> Value {
         let was_running = self.run_state == RunState::Running;
         self.run_state = RunState::Frozen;
@@ -629,7 +693,9 @@ impl Host {
             deadline: Instant::now() + ADVANCE_BUDGET,
             cancel,
         };
+        let early = self.play_check();
         let advance = self.machine.advance(unit, count, &control);
+        let replay = early.or(self.play_check());
         let machine = &self.machine;
         let mut value = json!({
             "status": if advance.stop == Stop::Completed { "completed" } else { "interrupted" },
@@ -657,6 +723,9 @@ impl Host {
             if reason == "execution_error" {
                 value["error"] = json!(machine.halted());
             }
+        }
+        if let Some(replay) = replay {
+            value["play_replay_result"] = replay.event();
         }
         value
     }
@@ -1013,6 +1082,9 @@ impl Host {
                 cancel,
             };
             let stop = self.machine.advance_to_display_flip(120, &control);
+            if let Some(replay) = self.play_check() {
+                value["play_replay_result"] = replay.event();
+            }
             value["display_flip"] = json!(match stop {
                 Stop::Completed => "reached",
                 Stop::Interrupted(reason) => reason,

@@ -276,6 +276,7 @@ pub struct Machine {
     game_hash: u64,
     poll_offset: u64,
     exact_poll_stepping: bool,
+    frame_stop: Option<u64>,
     halted: Option<String>,
     breakpoints: Vec<ExecBreakpoint>,
     next_breakpoint_id: u64,
@@ -313,6 +314,7 @@ impl Machine {
             game_hash,
             poll_offset: 0,
             exact_poll_stepping: false,
+            frame_stop: None,
             halted: None,
             breakpoints: Vec::new(),
             next_breakpoint_id: 1,
@@ -371,6 +373,20 @@ impl Machine {
     /// batch path, which must stop on the same instruction.
     pub fn set_exact_poll_stepping(&mut self, on: bool) {
         self.exact_poll_stepping = on;
+    }
+
+    /// Stop every advance at the frame boundary where the frame counter
+    /// reaches `frame` (interrupted with `play_replay_end`), whatever unit it
+    /// counts; `None` lifts the stop. A Play session sets it to its replay's
+    /// end frame so no advance, free-running or agent-requested, runs past the
+    /// hand-over check. A batch never crosses a frame boundary, so the stop is
+    /// always reached exactly.
+    pub fn set_frame_stop(&mut self, frame: Option<u64>) {
+        self.frame_stop = frame;
+    }
+
+    fn at_frame_stop(&self) -> bool {
+        self.frame_stop.is_some_and(|stop| self.frame >= stop)
     }
 
     /// Where the machine currently stands.
@@ -627,6 +643,9 @@ impl Machine {
             if done >= count {
                 break Stop::Completed;
             }
+            if self.at_frame_stop() {
+                break Stop::Interrupted("play_replay_end");
+            }
             if self.halted.is_some() {
                 break Stop::Interrupted("execution_error");
             }
@@ -706,6 +725,9 @@ impl Machine {
         let stop = loop {
             if self.display_start() != start {
                 break Stop::Completed;
+            }
+            if self.at_frame_stop() {
+                break Stop::Interrupted("play_replay_end");
             }
             if self.halted.is_some() {
                 break Stop::Interrupted("execution_error");

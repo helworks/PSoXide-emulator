@@ -966,8 +966,8 @@ fn reset_reboots_and_keeps_the_persistent_override() {
 #[test]
 fn play_session_refuses_input_injection() {
     let mut host = host();
-    host.set_play_session(true);
     let tape = scratch_dir("play-refuse").join("x.pxitape");
+    host.begin_play_session(tape.clone());
     let tape = tape.display().to_string();
     let cases = [
         ("set_input", json!({"buttons": ["start"]})),
@@ -997,14 +997,18 @@ fn play_session_refuses_input_injection() {
     let hello = ok(&mut host, "hello", json!({}));
     assert_eq!(hello["capability_notes"]["play_session"], true);
 
-    host.set_play_session(false);
-    ok(&mut host, "set_input", json!({"buttons": ["start"]}));
+    // Without a Play session the same request is accepted.
+    ok(
+        &mut self::host(),
+        "set_input",
+        json!({"buttons": ["start"]}),
+    );
 }
 
 #[test]
 fn play_session_allows_reads_and_steps() {
     let mut host = host();
-    host.set_play_session(true);
+    host.begin_play_session(scratch_dir("play-allow").join("x.pxitape"));
     ok(&mut host, "step", json!({"frames": 2}));
     ok(&mut host, "step_instructions", json!({"count": 10}));
     ok(&mut host, "step_input_polls", json!({"count": 1}));

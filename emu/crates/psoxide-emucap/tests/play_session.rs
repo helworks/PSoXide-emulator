@@ -16,10 +16,12 @@ use emulator_core::button::{CIRCLE, CROSS, START};
 use emulator_core::input_tape::{
     read_tape_full, tape_poll_bound_bytes, tape_to_csv, write_tape, PadSample, TapeClock, TapeEnd,
 };
+use psoxide_emucap::host::{Host, HostIdentity};
 use psoxide_emucap::machine::{
     AdvanceControl, BootConfig, Content, Machine, PadProfile, PortInput, Stop, Unit,
 };
 use psoxide_emucap::play_session::{PlaySession, ReplayReport, ReplayResult};
+use psoxide_emucap::wire::Request;
 
 use common::{at, drawing_guest_exe, COUNTER, INPUT_HASH, WIRE};
 
@@ -478,6 +480,113 @@ fn input_change_inside_a_poll_records_what_the_guest_read() {
     let result = run_until_result(&mut replay, &mut session, 20);
     assert_eq!(result.report, ReplayReport::SameState);
     assert_eq!(ram_u32(&replay, INPUT_HASH), recorded_hash);
+}
+
+/// A frozen host on `exe` with a Play session on `tape`.
+fn play_host(exe: Vec<u8>, tape: PathBuf) -> Host {
+    let mut host = Host::new(
+        boot(exe),
+        HostIdentity {
+            start_frozen: true,
+            ..Default::default()
+        },
+    );
+    host.begin_play_session(tape);
+    host
+}
+
+fn step(host: &mut Host, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let line = serde_json::json!({"v": 1, "id": 7, "method": method, "params": params});
+    let response = host.handle(&Request::parse(&line.to_string()).unwrap(), None);
+    assert!(response.ok, "{method} failed: {:?}", response.error);
+    response.result.unwrap()
+}
+
+#[test]
+fn agent_step_across_the_end_frame_stops_there_and_hands_over() {
+    let dir = ScratchDir::new("agent-step");
+    let recorded = record_session(&dir.tape(), drawing_guest_exe());
+    let mut host = play_host(drawing_guest_exe(), dir.tape());
+    assert!(host.play_replaying());
+
+    let before = step(&mut host, "step", serde_json::json!({"frames": 100}));
+    assert_eq!(before["status"], "completed");
+    assert!(before.get("play_replay_result").is_none());
+    assert!(host.play_replaying());
+
+    // 50 more frames would run 30 past the recorded end: the step stops at
+    // the end frame and reports the hand-over check made there.
+    let across = step(&mut host, "step", serde_json::json!({"frames": 50}));
+    assert_eq!(across["status"], "interrupted", "{across}");
+    assert_eq!(across["reason"], "play_replay_end");
+    assert_eq!(across["frame"], recorded.frame);
+    assert_eq!(across["completed"], recorded.frame - 100);
+    assert_eq!(across["boundary"], "frame_boundary");
+    assert_eq!(across["play_replay_result"]["report"], "same_state");
+    assert!(!host.play_replaying());
+    assert_eq!(
+        host.replay_result().map(|result| &result.report),
+        Some(&ReplayReport::SameState)
+    );
+    assert_eq!(ram_u32(host.machine(), INPUT_HASH), recorded.input_hash);
+    let events = step(&mut host, "poll_events", serde_json::json!({}));
+    let reported = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["type"] == "play_replay_result")
+        .count();
+    assert_eq!(reported, 1, "the hand-over is reported exactly once");
+
+    // After the hand-over a step is unaffected.
+    let after = step(&mut host, "step", serde_json::json!({"frames": 5}));
+    assert_eq!(after["status"], "completed");
+    assert_eq!(after["frame"], recorded.frame + 5);
+    assert!(after.get("play_replay_result").is_none());
+}
+
+#[test]
+fn poll_steps_and_free_frames_stop_at_the_end_frame_too() {
+    let dir = ScratchDir::new("agent-polls");
+    let recorded = record_session(&dir.tape(), drawing_guest_exe());
+
+    // Poll steps: plenty of polls past the end frame are asked for.
+    let mut host = play_host(drawing_guest_exe(), dir.tape());
+    step(
+        &mut host,
+        "step",
+        serde_json::json!({"frames": recorded.frame - 5}),
+    );
+    let polls = step(
+        &mut host,
+        "step_input_polls",
+        serde_json::json!({"count": 100}),
+    );
+    assert_eq!(polls["status"], "interrupted", "{polls}");
+    assert_eq!(polls["reason"], "play_replay_end");
+    assert_eq!(polls["frame"], recorded.frame);
+    assert_eq!(polls["play_replay_result"]["report"], "same_state");
+    assert!(!host.play_replaying());
+    // Past the hand-over the same request runs to completion.
+    let polls = step(
+        &mut host,
+        "step_input_polls",
+        serde_json::json!({"count": 3}),
+    );
+    assert_eq!(polls["status"], "completed");
+
+    // Free-running frames get the same check through the host.
+    let mut host = play_host(drawing_guest_exe(), dir.tape());
+    step(&mut host, "resume", serde_json::json!({}));
+    while host.play_replaying() {
+        host.run_free_frame();
+        assert!(host.machine().frame() <= recorded.frame);
+    }
+    assert_eq!(host.machine().frame(), recorded.frame);
+    assert_eq!(
+        host.replay_result().map(|result| &result.report),
+        Some(&ReplayReport::SameState)
+    );
 }
 
 #[test]

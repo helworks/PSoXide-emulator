@@ -24,7 +24,7 @@ use emulator_core::pad::PadMode;
 use emulator_core::Deinterlace;
 use psoxide_emucap::host::{Host, HostIdentity, RunState};
 use psoxide_emucap::machine::{BootConfig, Content, Machine, PortInput};
-use psoxide_emucap::play_session::{PlaySession, ReplayReport, ReplayResult};
+use psoxide_emucap::play_session::{ReplayReport, ReplayResult};
 use psoxide_emucap::transport::{self, Job};
 use psoxide_settings::settings::PortBindings;
 use psoxide_settings::{ConfigPaths, Settings};
@@ -103,13 +103,12 @@ pub fn run(paths: &ConfigPaths, args: PlaySessionArgs) -> Result<(), String> {
     // The headless host's boot: HLE BIOS and its default (analog) pad profile.
     let disc = args.disc.clone();
     let tape = args.tape.clone();
-    let (host, session) = psoxide_emucap::on_emulator_stack(move || {
+    let host = psoxide_emucap::on_emulator_stack(move || {
         let mut machine = Machine::boot(BootConfig::new(Content::File(disc)))?;
-        let session = PlaySession::begin(&mut machine, tape);
         machine.set_audio_capture(true);
         let mut host = Box::new(Host::new(machine, identity));
-        host.set_play_session(true);
-        Ok::<_, String>((host, session))
+        host.begin_play_session(tape);
+        Ok::<_, String>(host)
     })??;
 
     let jobs = match producer {
@@ -136,7 +135,7 @@ pub fn run(paths: &ConfigPaths, args: PlaySessionArgs) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|error| format!("event loop: {error}"))?;
     let mut window = PlayWindow {
         host,
-        session,
+        replay_reported: false,
         jobs,
         graphics: None,
         fullscreen: !args.windowed,
@@ -177,7 +176,8 @@ struct PlayWindow {
     /// The emucap host owning the machine. Boxed: it was built on the
     /// emulator's large-stack thread and is never moved by value again.
     host: Box<Host>,
-    session: PlaySession,
+    /// Whether the replay result has been printed.
+    replay_reported: bool,
     /// Jobs from the emucap transport (`--emucap`), until it goes away.
     jobs: Option<Receiver<Job>>,
     graphics: Option<Graphics>,
@@ -230,14 +230,12 @@ impl PlayWindow {
     /// session's per-frame work, then the frame's audio. Audio replayed flat
     /// out is dropped rather than played back as a fast-forward smear.
     fn run_frame(&mut self, live: PortInput) {
-        let replaying = self.session.replaying();
+        let replaying = self.host.play_replaying();
         if !replaying {
             self.host.machine_mut().set_port_input(0, Some(live));
         }
         self.host.run_free_frame();
-        if let Some(result) = psoxide_emucap::play_after_frame(&mut self.session, &mut self.host) {
-            eprintln!("{}", replay_line(&result));
-        }
+        self.report_replay();
         let samples = self.host.machine_mut().drain_audio();
         if replaying || samples.is_empty() {
             return;
@@ -247,17 +245,29 @@ impl PlayWindow {
         }
     }
 
+    /// Print the replay result once the host has it, whether a free-running
+    /// frame or an agent's step reached the hand-over.
+    fn report_replay(&mut self) {
+        if self.replay_reported {
+            return;
+        }
+        if let Some(result) = self.host.replay_result() {
+            eprintln!("{}", replay_line(result));
+            self.replay_reported = true;
+        }
+    }
+
     /// Run this redraw's guest frames.
     fn advance(&mut self, live: PortInput) {
-        if self.session.replaying() {
+        if self.host.play_replaying() {
             let slice_end = Instant::now() + REPLAY_SLICE;
             while self.host.run_state() == RunState::Running
-                && self.session.replaying()
+                && self.host.play_replaying()
                 && Instant::now() < slice_end
             {
                 self.run_frame(live);
             }
-            if !self.session.replaying() {
+            if !self.host.play_replaying() {
                 self.next_frame = Instant::now();
             }
             return;
@@ -303,7 +313,7 @@ impl PlayWindow {
 
     /// Save the session's tape and leave the event loop.
     fn close(&mut self, event_loop: &ActiveEventLoop) {
-        match self.session.save(self.host.machine()) {
+        match self.host.save_play_session() {
             Ok(true) => eprintln!("[play-session] saved the session tape"),
             Ok(false) => eprintln!(
                 "[play-session] tape left as it was (the replay had not handed over, or the tape could not be read)"
@@ -383,6 +393,7 @@ impl ApplicationHandler for PlayWindow {
                         eprintln!("[play-session] emucap transport ended; playing on without it");
                         self.jobs = None;
                     }
+                    self.report_replay();
                 }
                 let live = self.live_port1();
                 self.advance(live);
@@ -400,7 +411,7 @@ impl ApplicationHandler for PlayWindow {
         let now = Instant::now();
         let due = if self.host.run_state() != RunState::Running {
             self.last_redraw + FROZEN_TICK
-        } else if self.session.replaying() {
+        } else if self.host.play_replaying() {
             now
         } else {
             self.next_frame

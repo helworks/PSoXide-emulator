@@ -61,14 +61,8 @@ pub struct ProducerConfig {
 
 /// Emulator-thread side: execute jobs between frames until every sender is
 /// gone. While running, frames advance in real time (or flat out when
-/// `unthrottled`), and pending jobs are drained before every frame;
-/// `after_frame` runs after each free-running frame.
-pub fn serve_jobs(
-    host: &mut Host,
-    jobs: &Receiver<Job>,
-    unthrottled: bool,
-    after_frame: &mut dyn FnMut(&mut Host),
-) {
+/// `unthrottled`), and pending jobs are drained before every frame.
+pub fn serve_jobs(host: &mut Host, jobs: &Receiver<Job>, unthrottled: bool) {
     let mut next_frame = Instant::now();
     loop {
         if host.run_state() == RunState::Running {
@@ -96,7 +90,6 @@ pub fn serve_jobs(
                 }
             }
             host.run_free_frame();
-            after_frame(host);
             let period = host.machine().bus().vblank_period().max(1) as f64 / CPU_HZ;
             next_frame += Duration::from_secs_f64(period);
         } else {
@@ -341,7 +334,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            serve_jobs(&mut host, &jobs_rx, true, &mut |_| {});
+            serve_jobs(&mut host, &jobs_rx, true);
         });
         let producer = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
