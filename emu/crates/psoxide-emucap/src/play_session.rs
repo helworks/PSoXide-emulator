@@ -244,6 +244,12 @@ impl PlaySession {
         !self.replaying() && self.save_refused.is_none()
     }
 
+    /// Why this session never writes its tape, if it never does: the tape
+    /// could not be read, or is a non-Play tape.
+    pub fn save_refused(&self) -> Option<&str> {
+        self.save_refused.as_deref()
+    }
+
     /// Write the session so far as the session's tape: every recorded sample
     /// from poll 0, the current frame and display hash as its end, and the
     /// booted image's hash. Written to `<path>.tmp` and renamed over the tape,

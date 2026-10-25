@@ -136,6 +136,7 @@ pub fn run(paths: &ConfigPaths, args: PlaySessionArgs) -> Result<(), String> {
     let mut window = PlayWindow {
         host,
         replay_reported: false,
+        title: String::new(),
         jobs,
         graphics: None,
         fullscreen: !args.windowed,
@@ -171,6 +172,47 @@ fn replay_line(result: &ReplayResult) -> String {
     )
 }
 
+/// The window title: what the Play session is doing, so the player sees the
+/// replay's outcome without reading stderr.
+fn window_title(
+    replaying: bool,
+    result: Option<&ReplayResult>,
+    save_refused: Option<&str>,
+    frozen: bool,
+) -> String {
+    let mut title = String::from("PSoXide Play");
+    let status = if let Some(reason) = save_refused {
+        Some(format!("tape not saved: {reason}"))
+    } else if replaying {
+        Some("replaying…".to_string())
+    } else {
+        result.map(|result| {
+            let report = match &result.report {
+                ReplayReport::SameState => "same state".to_string(),
+                ReplayReport::Diverged { expected, actual } => {
+                    format!("DIVERGED (expected {expected:016x}, got {actual:016x})")
+                }
+                ReplayReport::NoTape | ReplayReport::TapeUnreadable(_) => {
+                    "new recording".to_string()
+                }
+            };
+            if result.image_changed {
+                format!("{report}, game image changed")
+            } else {
+                report
+            }
+        })
+    };
+    if let Some(status) = status {
+        title.push_str(" — ");
+        title.push_str(&status);
+    }
+    if frozen {
+        title.push_str(" — frozen by agent");
+    }
+    title
+}
+
 /// The window and the Play session it drives.
 struct PlayWindow {
     /// The emucap host owning the machine. Boxed: it was built on the
@@ -178,6 +220,8 @@ struct PlayWindow {
     host: Box<Host>,
     /// Whether the replay result has been printed.
     replay_reported: bool,
+    /// The window title last set.
+    title: String,
     /// Jobs from the emucap transport (`--emucap`), until it goes away.
     jobs: Option<Receiver<Job>>,
     graphics: Option<Graphics>,
@@ -257,6 +301,30 @@ impl PlayWindow {
         }
     }
 
+    /// The title for the session's current state.
+    fn current_title(&self) -> String {
+        window_title(
+            self.host.play_replaying(),
+            self.host.replay_result(),
+            self.host
+                .play_session()
+                .and_then(|session| session.save_refused()),
+            self.host.run_state() != RunState::Running,
+        )
+    }
+
+    /// Set the window title when the session's state changed.
+    fn update_title(&mut self) {
+        let title = self.current_title();
+        if title == self.title {
+            return;
+        }
+        if let Some(gfx) = self.graphics.as_ref() {
+            gfx.window.set_title(&title);
+            self.title = title;
+        }
+    }
+
     /// Run this redraw's guest frames.
     fn advance(&mut self, live: PortInput) {
         if self.host.play_replaying() {
@@ -316,7 +384,7 @@ impl PlayWindow {
         match self.host.save_play_session() {
             Ok(true) => eprintln!("[play-session] saved the session tape"),
             Ok(false) => eprintln!(
-                "[play-session] tape left as it was (the replay had not handed over, or the tape could not be read)"
+                "[play-session] tape left as it was (the replay had not handed over, or the tape was unreadable or a non-Play tape)"
             ),
             Err(error) => {
                 eprintln!("[play-session] saving the session tape failed: {error}");
@@ -333,8 +401,9 @@ impl ApplicationHandler for PlayWindow {
             return;
         }
         crate::app_icon::set_application_icon();
+        self.title = self.current_title();
         let mut attrs = Window::default_attributes()
-            .with_title("PSoXide Play session")
+            .with_title(self.title.clone())
             .with_inner_size(winit::dpi::PhysicalSize::new(
                 WINDOWED_WIDTH,
                 WINDOWED_HEIGHT,
@@ -397,6 +466,7 @@ impl ApplicationHandler for PlayWindow {
                 }
                 let live = self.live_port1();
                 self.advance(live);
+                self.update_title();
                 self.present();
             }
             _ => {}
@@ -422,5 +492,62 @@ impl ApplicationHandler for PlayWindow {
         } else {
             event_loop.set_control_flow(ControlFlow::WaitUntil(due));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(report: ReplayReport) -> ReplayResult {
+        ReplayResult {
+            report,
+            image_changed: false,
+        }
+    }
+
+    #[test]
+    fn title_shows_the_replay_outcome_and_agent_freeze() {
+        assert_eq!(
+            window_title(true, None, None, false),
+            "PSoXide Play — replaying…"
+        );
+        assert_eq!(
+            window_title(false, Some(&result(ReplayReport::SameState)), None, false),
+            "PSoXide Play — same state"
+        );
+        assert_eq!(
+            window_title(
+                false,
+                Some(&result(ReplayReport::Diverged {
+                    expected: 0x1,
+                    actual: 0xab
+                })),
+                None,
+                false
+            ),
+            "PSoXide Play — DIVERGED (expected 0000000000000001, got 00000000000000ab)"
+        );
+        assert_eq!(
+            window_title(false, Some(&result(ReplayReport::NoTape)), None, false),
+            "PSoXide Play — new recording"
+        );
+        let refused = result(ReplayReport::TapeUnreadable("x.tape: non-Play".into()));
+        assert_eq!(
+            window_title(false, Some(&refused), Some("x.tape: non-Play"), false),
+            "PSoXide Play — tape not saved: x.tape: non-Play"
+        );
+        assert_eq!(
+            window_title(true, None, None, true),
+            "PSoXide Play — replaying… — frozen by agent"
+        );
+        let changed = ReplayResult {
+            report: ReplayReport::SameState,
+            image_changed: true,
+        };
+        assert_eq!(
+            window_title(false, Some(&changed), None, false),
+            "PSoXide Play — same state, game image changed"
+        );
     }
 }
